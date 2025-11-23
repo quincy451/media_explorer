@@ -1,0 +1,26 @@
+# Visual Studio cache
+.vs/
+*.ipch
+
+# Build artifacts
+*.obj
+*.pdb
+*.tlog
+*.ilk
+*.idb
+*.pch
+
+# Build directories
+/x64/
+/build/
+
+# User local settings
+*.user
+*.suo
+
+# Logs
+logs/
+*.log
+
+# Backup files
+*.bak
