@@ -51,6 +51,7 @@
 #include <cwctype>
 #include <shlobj.h>     // SHCreateDirectoryExW
 #include <cstdarg>
+#include <io.h> // for _unlink
 
 
 #pragma comment(lib, "Comctl32.lib")
@@ -113,7 +114,7 @@ struct AppConfig {
     std::wstring upscaleDirectory;  // e.g. w:\upscale\autosubmit (may be empty)
     bool ffmpegAvailable = false;  // if true, ffmpeg-based tools are enabled & shown in help
     bool ffprobeAvailable = false;  // if true, ffprobe-based info is enabled & shown in help
-    bool videoCombineAvailable = false;   // if true, Ctrl+Plus / video_combine.exe is enabled
+//    bool videoCombineAvailable = false;   // if true, Ctrl+Plus / video_combine.exe is enabled
 
     bool        loggingEnabled = false; // master on/off
     std::wstring loggingPath;          // folder from INI
@@ -668,7 +669,7 @@ static std::wstring ExtLower(const std::wstring& p) {
 }
 static bool IsVideoFile(const std::wstring& path) {
     static const wchar_t* exts[] = {
-        L".mp4", L".mkv", L".mov", L".avi", L".wmv", L".m4v", L".ts", L".m2ts", L".webm", L".flv"
+        L".mp4", L".mkv", L".mov", L".avi", L".wmv", L".m4v", L".ts", L".m2ts", L".webm", L".flv", L".rm",
     };
     std::wstring e = ExtLower(path);
     for (size_t i = 0; i < _countof(exts); ++i) if (e == exts[i]) return true;
@@ -1020,11 +1021,6 @@ static void LoadConfigFromIni() {
             g_cfg.loggingEnabled =
                 (v == L"1" || v == L"true" || v == L"yes" || v == L"on" || v == L"y");
         }
-        else if (key == L"videocombineavailable" || key == L"video_combineavailable") {
-            std::wstring v = ToLower(val);
-            g_cfg.videoCombineAvailable =
-                (v == L"1" || v == L"true" || v == L"yes" || v == L"on" || v == L"y");
-        }
         else if (key == L"loggingpath") {
             g_cfg.loggingPath = val;
         }
@@ -1038,18 +1034,28 @@ static void LoadConfigFromIni() {
     InitLoggingFromConfig();
     if (g_cfg.loggingEnabled) 
     {
-        LogLine(L"Config: upscale=\"%s\" ffmpeg=%d ffprobe=%d video_combine=%d loggingPath=\"%s\"",
+        LogLine(L"Config: upscale=\"%s\" ffmpeg=%d ffprobe=%d loggingPath=\"%s\"",
             g_cfg.upscaleDirectory.c_str(),
             g_cfg.ffmpegAvailable ? 1 : 0,
             g_cfg.ffprobeAvailable ? 1 : 0,
-            g_cfg.videoCombineAvailable ? 1 : 0,
             g_cfg.loggingPath.c_str());
     }
 }
 
 
 // Help
+// Help
 static void ShowHelp() {
+    // If a libVLC media player exists and is currently playing,
+    // pause it while the help window is visible.
+    bool wasPlaying = false;
+    if (g_mp) {
+        wasPlaying = (libvlc_media_player_is_playing(g_mp) > 0);
+        if (wasPlaying) {
+            libvlc_media_player_set_pause(g_mp, 1);
+        }
+    }
+
     std::wstring msg;
     msg += L"Media Explorer - Help\n\n";
 
@@ -1067,10 +1073,9 @@ static void ShowHelp() {
         L"  Ctrl+F               : Search (recursive). In Search view: refine (AND/intersection)\n"
         L"  Ctrl+Up/Down         : Move selected row up/down (single selection)\n";
 
-    if (g_cfg.videoCombineAvailable) {
+    if (g_cfg.ffmpegAvailable) {
         msg += L"  Ctrl+Plus            : Combine selected files into one video (background)\n";
     }
-
 
     msg += L"  Ctrl+C / Ctrl+X / Ctrl+V : Copy / Cut / Paste files\n"
         L"  Del                  : Delete selected files\n"
@@ -1112,6 +1117,11 @@ static void ShowHelp() {
     }
 
     MessageBoxW(g_hwndMain, msg.c_str(), L"Media Explorer - Help", MB_OK);
+
+    // Resume only if it was actually playing before F1 was pressed
+    if (g_mp && wasPlaying) {
+        libvlc_media_player_set_pause(g_mp, 0);
+    }
 }
 
 // ----------------------------- ListView helpers
@@ -1823,10 +1833,10 @@ static bool PromptCombinedOutputName(const std::wstring& defaultName, std::wstri
 
 // Combine selected files using external video_combine.exe in background thread.
 static void Browser_CombineSelected() {
-    if (!g_cfg.videoCombineAvailable) {
+    if (!g_cfg.ffmpegAvailable) {
         MessageBoxW(g_hwndMain,
-            L"video_combineAvailable is disabled in mediaexplorer.ini.\n"
-            L"Set video_combineAvailable = 1 to enable combining videos.",
+            L"video_combine is disabled in mediaexplorer.ini.\n"
+            L"Set ffmpegAvailable = 1 to enable combining videos.",
             L"Combine videos", MB_OK);
         return;
     }
@@ -2656,6 +2666,349 @@ static void PostCombineOutput(CombineTask* task, const std::wstring& text) {
     PostMessageW(g_hwndMain, WM_APP_COMBINE_OUTPUT, (WPARAM)task, (LPARAM)p);
 }
 
+// -------- Embedded video_combine logic (internal, ffmpeg-based) --------
+
+// Narrow/wide helpers using the ANSI code page (matches old console argv behavior).
+static std::string NarrowFromWideACP(const std::wstring& ws) {
+    if (ws.empty()) return std::string();
+    int len = WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return std::string();
+    std::string s(len - 1, '\0');
+    WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, &s[0], len, NULL, NULL);
+    return s;
+}
+
+static std::wstring WideFromNarrowACP(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, NULL, 0);
+    if (len <= 0) return std::wstring();
+    std::wstring ws(len - 1, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, &ws[0], len);
+    return ws;
+}
+
+// Log an ANSI command line into the combine log window
+static void VC_LogCmd(CombineTask* task, const char* cmd) {
+    if (!task || !cmd) return;
+    int n = MultiByteToWideChar(CP_ACP, 0, cmd, -1, NULL, 0);
+    if (n <= 0) return;
+    std::wstring w(n - 1, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, cmd, -1, &w[0], n);
+    PostCombineOutput(task, w + L"\r\n");
+}
+
+static void VC_LogMsg(CombineTask* task, const std::wstring& msg) {
+    if (!task) return;
+    PostCombineOutput(task, msg);
+}
+
+// Update combine window title with a status suffix, e.g. "(ffmpeg in progress...)"
+static void VC_UpdateCombineWindowTitle(CombineTask* task, const wchar_t* statusSuffix) {
+    if (!task || !task->hwnd) return;
+    std::wstring title = L"Combine: ";
+    title += task->title;
+    if (statusSuffix && *statusSuffix) {
+        title += L" ";
+        title += statusSuffix;
+    }
+    SetWindowTextW(task->hwnd, title.c_str());
+}
+
+// Run a command in a hidden console and wait for it to finish.
+// Returns the process exit code, or (DWORD)-1 on failure to spawn.
+static DWORD RunHiddenCommandAnsi(const char* cmdAnsi) {
+    if (!cmdAnsi || !*cmdAnsi) return (DWORD)-1;
+
+    std::wstring w = WideFromNarrowACP(cmdAnsi);
+    if (w.empty()) return (DWORD)-1;
+
+    std::vector<wchar_t> cmdBuf(w.size() + 1);
+    wcscpy_s(cmdBuf.data(), cmdBuf.size(), w.c_str());
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    DWORD flags = CREATE_NO_WINDOW;
+
+    BOOL ok = CreateProcessW(
+        NULL,               // use command line for program+args
+        cmdBuf.data(),      // modifiable buffer
+        NULL, NULL,
+        FALSE,
+        flags,
+        NULL, NULL,
+        &si, &pi);
+    if (!ok) {
+        return (DWORD)-1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exitCode;
+}
+
+// Same, but execute via "cmd.exe /C <command>" for shell built-ins like copy.
+static DWORD RunHiddenCommandAnsiViaCmd(const char* innerCmdAnsi) {
+    if (!innerCmdAnsi || !*innerCmdAnsi) return (DWORD)-1;
+    char full[9000];
+    sprintf(full, "cmd.exe /C %s", innerCmdAnsi);
+    return RunHiddenCommandAnsi(full);
+}
+
+
+// From video_combine.cpp: prevent duplicate entries in list.
+static bool nodup_add(std::vector<std::string>& list, const std::string& new_file) {
+    bool retval = false;
+    int limit = (int)list.size();
+    for (int index = 0; index < limit; ++index) {
+        if (list[index] == new_file) {
+            retval = true;
+            break;
+        }
+    }
+    if (!retval) list.push_back(new_file);
+    return retval;
+}
+
+// ---- Direct ports of video_combine.cpp functions (same method, in-process) ----
+
+// Stage 1: convert each source to an .mpg using ffmpeg -qscale:v 1
+static bool convert2mpg(const std::vector<std::string>& srcfn,
+    std::vector<std::string>& mpgfn,
+    CombineTask* task)
+{
+    bool retval = true;
+    char drive[260];
+    char path[260];
+    char fn[260];
+    int  limit = (int)srcfn.size();
+    char mpgfile[260];
+    char cmd[8192];
+
+    for (int index = 0; index < limit; ++index) {
+        _splitpath(srcfn[index].c_str(), drive, path, fn, NULL);
+        sprintf(mpgfile, "%s%s%s.mpg", drive, path, fn);
+        mpgfn.push_back(mpgfile);
+
+        // ffmpeg -i "src" -qscale:v 1 "dst.mpg"
+        sprintf(cmd, "ffmpeg -i \"%s\" -qscale:v 1 \"%s\"",
+            srcfn[index].c_str(), mpgfile);
+        VC_LogCmd(task, cmd);
+
+        DWORD exitCode = RunHiddenCommandAnsi(cmd);
+        if (exitCode == 0) {
+            // success
+        }
+        else {
+            char fail[9000];
+            sprintf(fail, "%s failed (exit=%lu)", cmd, (unsigned long)exitCode);
+            VC_LogCmd(task, fail);
+            retval = false;
+            break;
+        }
+    }
+    return retval;
+}
+
+// Stage 2: copy /B file1.mpg+file2.mpg+... combined.mpg
+static bool combinempg(const std::vector<std::string>& mpgfn,
+    std::string& combinefile,
+    CombineTask* task)
+{
+    bool retval = true;
+    char cmd[8192];
+    int  limit = (int)mpgfn.size();
+
+    strcpy(cmd, "copy /B ");
+
+    for (int index = 0; index < limit; ++index) {
+        strcat(cmd, "\"");
+        strcat(cmd, mpgfn[index].c_str());
+        strcat(cmd, "\" ");
+
+        if (index < limit - 1)
+            strcat(cmd, "+ ");
+    }
+
+    strcat(cmd, " \"");
+    strcat(cmd, combinefile.c_str());
+    strcat(cmd, "\"");
+
+    VC_LogCmd(task, cmd);
+
+    DWORD exitCode = RunHiddenCommandAnsiViaCmd(cmd);
+    if (exitCode == 0) {
+        // Delete intermediate .mpg files just like original code
+        for (int index = 0; index < limit; ++index) {
+            _unlink(mpgfn[index].c_str());
+        }
+    }
+    else {
+        char fail[9000];
+        sprintf(fail, "%s failed (exit=%lu)", cmd, (unsigned long)exitCode);
+        VC_LogCmd(task, fail);
+        retval = false;
+    }
+    return retval;
+}
+
+// Stage 3: convert combined.mpg back to final format using ffmpeg -qscale:v 2
+static bool convertback(const std::string& combinefile,
+    const std::string& finalfile,
+    CombineTask* task)
+{
+    char cmd[8192];
+    bool retval = true;
+
+    // ffmpeg -i "combined.mpg" -qscale:v 2 "final.ext"
+    sprintf(cmd, "ffmpeg -i \"%s\" -qscale:v 2 \"%s\"",
+        combinefile.c_str(), finalfile.c_str());
+    VC_LogCmd(task, cmd);
+
+    DWORD exitCode = RunHiddenCommandAnsi(cmd);
+    if (exitCode == 0) {
+        // success
+    }
+    else {
+        char fail[9000];
+        sprintf(fail, "%s failed (exit=%lu)", cmd, (unsigned long)exitCode);
+        VC_LogCmd(task, fail);
+        retval = false;
+    }
+    return retval;
+}
+
+// Full video_combine "combine_videos" logic as a function:
+// uses the 3 stages above, same algorithm as original tool.
+static bool VC_CombineVideos(CombineTask* task,
+    const std::vector<std::string>& srcfn,
+    std::string& finalfile)
+{
+    bool retval = false;
+    std::vector<std::string> mpgfn;
+    std::string combinefile;
+    char drive[260];
+    char path[260];
+    char fn[260];
+
+    int limit = (int)srcfn.size();
+    if (limit == 0) return false;
+
+    std::wstring wFinal = WideFromNarrowACP(finalfile);
+    VC_LogMsg(task, L"Start Combining Video " + wFinal + L"\r\n");
+
+    if (convert2mpg(srcfn, mpgfn, task)) {
+        _splitpath(finalfile.c_str(), drive, path, fn, NULL);
+        combinefile = drive;
+        combinefile += path;
+        combinefile += fn;
+        combinefile += ".mpg";
+
+        if (combinempg(mpgfn, combinefile, task)) {
+            if (convertback(combinefile, finalfile, task)) {
+                VC_LogMsg(task, L"Video combined successful for " + wFinal + L"\r\n");
+                retval = true;
+                _unlink(combinefile.c_str());
+            }
+        }
+    }
+
+    if (!retval) {
+        VC_LogMsg(task, L"Video combined failed for " + WideFromNarrowACP(finalfile) + L"\r\n");
+    }
+
+    return retval;
+}
+
+// Run the embedded video_combine algorithm using the copied .mp4/.mkv files
+// and the intended user-chosen output name (combinedFull).
+static bool RunEmbeddedVideoCombine(CombineTask* task,
+    const std::vector<std::wstring>& copiedFiles,
+    const std::wstring& combinedFull)
+{
+    // Build ANSI source list with duplicate check...
+    std::vector<std::string> srcAnsi;
+    srcAnsi.reserve(copiedFiles.size());
+
+    for (const auto& wf : copiedFiles) {
+        std::string a = NarrowFromWideACP(wf);
+        if (a.empty()) continue;
+        if (nodup_add(srcAnsi, a)) {
+            VC_LogMsg(task, L"Error Duplicate File in Combine filelist:\r\n  " + wf + L"\r\n");
+            return false;
+        }
+    }
+    if (srcAnsi.empty()) {
+        VC_LogMsg(task, L"No source files to combine.\r\n");
+        return false;
+    }
+
+    // Emulate video_combine's main() behavior...
+    std::string destAnsi = NarrowFromWideACP(combinedFull);
+    char drive[260], path[260], fn[260], ext[260], lastfn[260];
+    _splitpath(destAnsi.c_str(), drive, path, fn, ext);
+    sprintf(lastfn, "%s%s%s_combined%s", drive, path, fn, ext);
+    std::string finalfile(lastfn);
+
+    // Show ffmpeg progress in the combine window title while we work
+    VC_UpdateCombineWindowTitle(task, L"(ffmpeg in progress...)");
+
+    bool ok = VC_CombineVideos(task, srcAnsi, finalfile);
+
+    // Update task->combinedFull to the actual final path (with _combined suffix)
+    if (ok) {
+        task->combinedFull = WideFromNarrowACP(finalfile);
+    }
+
+    VC_UpdateCombineWindowTitle(task, ok ? L"(done)" : L"(failed)");
+    return ok;
+}
+
+// Delete the combine working directory and its files (shallow) on success.
+static void DeleteCombineWorkingDirIfExists(CombineTask* task) {
+    if (!task) return;
+    if (task->workingDir.empty()) return;
+
+    std::wstring dir = task->workingDir;
+
+    // Ensure trailing slash for building file paths
+    std::wstring pattern = EnsureSlash(dir) + L"*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+                continue;
+
+            std::wstring full = EnsureSlash(dir) + fd.cFileName;
+
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                // Working dir should be flat; skip any subdirs just in case.
+                continue;
+            }
+            DeleteFileW(full.c_str());
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    if (!RemoveDirectoryW(dir.c_str())) {
+        DWORD err = GetLastError();
+        wchar_t buf[512];
+        swprintf_s(buf,
+            L"Warning: failed to remove combine working directory \"%s\" (err=%lu)\r\n",
+            dir.c_str(), err);
+        PostCombineOutput(task, buf);
+        LogLine(L"Failed to remove combine working directory \"%s\" err=%lu",
+            dir.c_str(), err);
+    }
+    else {
+        LogLine(L"Removed combine working directory \"%s\"", dir.c_str());
+    }
+}
+
 static DWORD WINAPI CombineThreadProc(LPVOID param) {
     CombineTask* task = (CombineTask*)param;
     if (!task) return 0;
@@ -2673,7 +3026,7 @@ static DWORD WINAPI CombineThreadProc(LPVOID param) {
         }
     }
 
-    // Copy files into working directory
+    // Copy files into working directory (same as before)
     {
         wchar_t buf[256];
         swprintf_s(buf, L"Copying %zu file(s)...\r\n", task->srcFiles.size());
@@ -2707,99 +3060,24 @@ static DWORD WINAPI CombineThreadProc(LPVOID param) {
         copiedFiles.push_back(dst);
     }
 
-    PostCombineOutput(task, L"All files copied. Running video_combine...\r\n");
+    PostCombineOutput(task, L"All files copied. Combining via internal ffmpeg pipeline...\r\n");
 
-    // Build command line
-    std::wstring cmd = L"video_combine";
-    for (const auto& f : copiedFiles) {
-        cmd += L" \"";
-        cmd += f;
-        cmd += L"\"";
-    }
-    cmd += L" \"";
-    cmd += task->combinedFull;
-    cmd += L"\"";
+    // --- NEW: run embedded video_combine algorithm instead of video_combine.exe ---
+    bool ok = RunEmbeddedVideoCombine(task, copiedFiles, task->combinedFull);
 
-    PostCombineOutput(task, L"Command:\r\n");
-    PostCombineOutput(task, cmd + L"\r\n\r\n");
+    DWORD exitCode = ok ? 0 : 1;
 
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-
-    HANDLE hRead = NULL, hWrite = NULL;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        PostCombineOutput(task, L"ERROR: Failed to create pipe.\r\n");
-        PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)3);
-        return 0;
-    }
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags |= STARTF_USESTDHANDLES;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
-
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> cmdBuf(cmd.size() + 1);
-    wcscpy_s(cmdBuf.data(), cmdBuf.size(), cmd.c_str());
-
-    BOOL ok = CreateProcessW(NULL, cmdBuf.data(),
-        NULL, NULL, TRUE,
-        CREATE_NO_WINDOW,
-        NULL, NULL,
-        &si, &pi);
-    CloseHandle(hWrite);
-    hWrite = NULL;
-
-    if (!ok) {
-        PostCombineOutput(task, L"ERROR: Failed to start video_combine.exe.\r\n");
-        CloseHandle(hRead);
-        PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)4);
-        return 0;
+    // On success, remove the working directory that held the copied parts
+    if (ok) {
+        DeleteCombineWorkingDirIfExists(task);
     }
 
-    task->hProcess = pi.hProcess;
-    CloseHandle(pi.hThread);
-
-    // Read stdout/stderr
-    char buf[4096];
-    DWORD bytes = 0;
-    std::string accum;
-
-    while (ReadFile(hRead, buf, sizeof(buf), &bytes, NULL) && bytes > 0) {
-        accum.append(buf, buf + bytes);
-        size_t pos = 0;
-        while (true) {
-            size_t nl = accum.find('\n', pos);
-            if (nl == std::string::npos) {
-                accum.erase(0, pos);
-                break;
-            }
-            std::string line = accum.substr(pos, nl - pos + 1);
-            pos = nl + 1;
-
-            int n = MultiByteToWideChar(CP_ACP, 0, line.c_str(), (int)line.size(), NULL, 0);
-            if (n <= 0) continue;
-            std::wstring wline(n, L'\0');
-            MultiByteToWideChar(CP_ACP, 0, line.c_str(), (int)line.size(), &wline[0], n);
-            PostCombineOutput(task, wline);
-        }
-    }
-    CloseHandle(hRead);
-
-    WaitForSingleObject(task->hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(task->hProcess, &exitCode);
-    CloseHandle(task->hProcess);
-    task->hProcess = NULL;
-
-    wchar_t doneMsg[128];
-    swprintf_s(doneMsg, L"\r\n[video_combine exited with code %lu]\r\n", exitCode);
+    wchar_t doneMsg[256];
+    swprintf_s(doneMsg, L"\r\n[internal video combine %s with code %lu]\r\n",
+        ok ? L"succeeded" : L"failed", exitCode);
     PostCombineOutput(task, doneMsg);
 
+    // Notify main window that the combine task is done (same message ID as before)
     PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)exitCode);
     return 0;
 }
@@ -3368,6 +3646,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
             SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)p->c_str());
             SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+        }
+        if (p && !p->empty()) {
+            // Mirror to main log file (if loggingEnabled)
+            LogLine(L"[Combine] %s", p->c_str());
         }
         delete p;
         return 0;
