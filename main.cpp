@@ -95,6 +95,8 @@ struct Row {
 };
 std::vector<Row> g_rows;
 
+static bool g_loadingFolder = false;
+
 // sorting
 int  g_sortCol = 0;      // 0=Name,1=Type,2=Size,3=Modified,4=Resolution,5=Duration
 bool g_sortAsc = true;
@@ -193,6 +195,7 @@ struct CombineTask {
     std::wstring combinedFull;  // final combined video path
     std::wstring title;         // short description (e.g., output file name)
     bool   running;
+    bool   hiddenByPlayback;    // <--- NEW
 
     CombineTask() :
         hThread(NULL),
@@ -242,10 +245,14 @@ struct FfmpegTask {
     bool running = false;
     bool done = false;
     DWORD exitCode = 0;
+    bool hiddenByPlayback = false;  // <--- NEW
 };
 
 CRITICAL_SECTION g_ffLock;
 std::vector<FfmpegTask*> g_ffTasks;
+// Log/feedback windows that we temporarily hide while the user is
+// watching video fullscreen. We remember which ones we hid so we
+// can restore only those when leaving fullscreen.
 
 static bool HasRunningFfmpegTasks() {
     EnterCriticalSection(&g_ffLock);
@@ -256,6 +263,70 @@ static bool HasRunningFfmpegTasks() {
     LeaveCriticalSection(&g_ffLock);
     return any;
 }
+
+// Hide all combine + ffmpeg log windows and remember which ones
+// were visible so we can restore them when leaving fullscreen.
+// Hide all combine + ffmpeg log windows and remember that they were
+// hidden because of playback via the per-task hiddenByPlayback flag.
+static void HideAllLogWindowsForPlayback()
+{
+    // Combine (video_combine) log windows
+    EnterCriticalSection(&g_combineLock);
+    for (CombineTask* t : g_combineTasks)
+    {
+        if (t && t->hwnd && IsWindow(t->hwnd) && IsWindowVisible(t->hwnd))
+        {
+            t->hiddenByPlayback = true;
+            ShowWindow(t->hwnd, SW_HIDE);
+        }
+    }
+    LeaveCriticalSection(&g_combineLock);
+
+    // Per-file FFmpeg task log windows
+    EnterCriticalSection(&g_ffLock);
+    for (FfmpegTask* t : g_ffTasks)
+    {
+        if (t && t->hwnd && IsWindow(t->hwnd) && IsWindowVisible(t->hwnd))
+        {
+            t->hiddenByPlayback = true;
+            ShowWindow(t->hwnd, SW_HIDE);
+        }
+    }
+    LeaveCriticalSection(&g_ffLock);
+}
+
+// Restore any log windows that were hidden specifically due to playback.
+static void RestoreLogWindowsAfterPlayback()
+{
+    // Combine logs
+    EnterCriticalSection(&g_combineLock);
+    for (CombineTask* t : g_combineTasks)
+    {
+        if (t && t->hiddenByPlayback && t->hwnd && IsWindow(t->hwnd))
+        {
+            ShowWindow(t->hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(t->hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            t->hiddenByPlayback = false;
+        }
+    }
+    LeaveCriticalSection(&g_combineLock);
+
+    // FFmpeg logs
+    EnterCriticalSection(&g_ffLock);
+    for (FfmpegTask* t : g_ffTasks)
+    {
+        if (t && t->hiddenByPlayback && t->hwnd && IsWindow(t->hwnd))
+        {
+            ShowWindow(t->hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(t->hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            t->hiddenByPlayback = false;
+        }
+    }
+    LeaveCriticalSection(&g_ffLock);
+}
+
 
 // ----------------------------- FFmpeg task log window + helpers
 
@@ -316,6 +387,18 @@ static HWND CreateFfmpegLogWindow(FfmpegTask* task) {
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"FfmpegLogClass", title.c_str(),
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         X, Y, W, H, g_hwndMain, NULL, g_hInst, task);
+
+    if (hwnd && task)
+    {
+        task->hwnd = hwnd;
+
+        if (g_inPlayback)
+        {
+            if (IsWindowVisible(hwnd))
+                ShowWindow(hwnd, SW_HIDE);
+            task->hiddenByPlayback = true;
+        }
+    }
     return hwnd;
 }
 
@@ -554,8 +637,43 @@ static void PumpMessagesThrottled(DWORD msInterval) {
         DispatchMessageW(&msg);
     }
 }
+// --- Folder-load title busy animation (SPC . o O SPC ...) ---
+static void BeginFolderLoadTitle(const std::wstring& folder,
+    std::wstring& ioTitleWithChar,
+    DWORD& ioLastAnimTick,
+    int& ioFrame)
+{
+    ioTitleWithChar = L"Media Explorer - ";
+    ioTitleWithChar += EnsureSlash(folder);
+    ioTitleWithChar.push_back(L' '); // start on SPC (0x20)
+    SetWindowTextW(g_hwndMain, ioTitleWithChar.c_str());
+    UpdateWindow(g_hwndMain);
+
+    ioLastAnimTick = GetTickCount();
+    ioFrame = 1; // after ~1s we want '.' first (SPC -> '.' -> 'o' -> 'O' -> SPC ...)
+    PumpMessagesThrottled(0);
+}
+
+static void TickFolderLoadTitle(std::wstring& ioTitleWithChar,
+    DWORD& ioLastAnimTick,
+    int& ioFrame)
+{
+    // Keep Windows happy during long loops (prevents "Not Responding")
+    PumpMessagesThrottled(50);
+
+    DWORD now = GetTickCount();
+    if (now - ioLastAnimTick >= 1000) { // once per second
+        static const wchar_t kFrames[4] = { L' ', L'.', L'o', L'O' };
+        ioTitleWithChar.back() = kFrames[ioFrame & 3];
+        ++ioFrame;
+
+        SetWindowTextW(g_hwndMain, ioTitleWithChar.c_str());
+        ioLastAnimTick = now;
+    }
+}
+
 static void SetTitleSearchingFolder(const std::wstring& folder) {
-    std::wstring t = L"Media Explorer (libVLC) - searching ";
+    std::wstring t = L"Media Explorer - searching ";
     t += EnsureSlash(folder);
     SetWindowTextW(g_hwndMain, t.c_str());
     PumpMessagesThrottled(50);
@@ -750,7 +868,7 @@ static std::wstring JoinTermsForTitle() {
     return s;
 }
 static void SetTitleFolderOrDrives() {
-    std::wstring t = L"Media Explorer (libVLC) - ";
+    std::wstring t = L"Media Explorer - ";
     if (g_view == ViewKind::Drives) t += L"[Drives]";
     else if (g_view == ViewKind::Folder) t += EnsureSlash(g_folder);
     else t += L"Search - " + JoinTermsForTitle();
@@ -1169,6 +1287,58 @@ static void LV_Rebuild() {
     for (int i = 0; i < (int)g_rows.size(); ++i) LV_Add(i, g_rows[i]);
 }
 
+// Update an existing ListView row from g_rows[i] without rebuilding the whole list.
+static void LV_UpdateRow(int rowIndex, const Row& r) {
+    // Column 0: Name
+    LVITEMW it{};
+    it.mask = LVIF_TEXT;
+    it.iItem = rowIndex;
+    it.iSubItem = 0;
+    it.pszText = const_cast<wchar_t*>(r.name.c_str());
+    ListView_SetItem(g_hwndList, &it);
+
+    // Column 1: Type
+    const wchar_t* type = r.isDir ? L"Folder" : L"Video";
+    ListView_SetItemText(g_hwndList, rowIndex, 1, const_cast<wchar_t*>(type));
+
+    // Column 2: Size
+    if (!r.isDir && r.size > 0) {
+        std::wstring s = FormatSize(r.size);
+        ListView_SetItemText(g_hwndList, rowIndex, 2, const_cast<wchar_t*>(s.c_str()));
+    }
+    else {
+        ListView_SetItemText(g_hwndList, rowIndex, 2, const_cast<wchar_t*>(L""));
+    }
+
+    // Column 3: Modified
+    if (r.modified.dwLowDateTime || r.modified.dwHighDateTime) {
+        std::wstring m = FormatFileTime(r.modified);
+        ListView_SetItemText(g_hwndList, rowIndex, 3, const_cast<wchar_t*>(m.c_str()));
+    }
+    else {
+        ListView_SetItemText(g_hwndList, rowIndex, 3, const_cast<wchar_t*>(L""));
+    }
+
+    // Column 4: Resolution
+    if (!r.isDir && (r.vW > 0 || r.vH > 0)) {
+        wchar_t buf[64];
+        swprintf_s(buf, L"%dx%d", r.vW, r.vH);
+        ListView_SetItemText(g_hwndList, rowIndex, 4, buf);
+    }
+    else {
+        ListView_SetItemText(g_hwndList, rowIndex, 4, const_cast<wchar_t*>(L""));
+    }
+
+    // Column 5: Duration
+    if (!r.isDir && r.vDur100ns > 0) {
+        std::wstring ds = FormatDuration100ns(r.vDur100ns);
+        ListView_SetItemText(g_hwndList, rowIndex, 5, const_cast<wchar_t*>(ds.c_str()));
+    }
+    else {
+        ListView_SetItemText(g_hwndList, rowIndex, 5, const_cast<wchar_t*>(L""));
+    }
+}
+
 // ----------------------------- Sorting (dirs first)
 static void SortRows(int col, bool asc) {
     g_sortCol = col; g_sortAsc = asc;
@@ -1285,7 +1455,24 @@ static void ShowFolder(std::wstring abs) {
 
     if (abs.size() == 2 && abs[1] == L':') abs += L'\\';
     abs = EnsureSlash(abs);
-    g_view = ViewKind::Folder; g_folder = abs; g_rows.clear();
+    g_view = ViewKind::Folder;
+    g_folder = abs;
+    g_rows.clear();
+
+    // ------------------------------------------------------------
+    // NEW: set title immediately + prepare 1-char busy animation
+    // Sequence: ' ' '.' 'o' 'O' ' ' ...
+    // ------------------------------------------------------------
+    std::wstring animTitle = L"Media Explorer - ";
+    animTitle += EnsureSlash(g_folder);   // should already have trailing '\'
+    animTitle.push_back(L' ');            // start on SPC (0x20)
+
+    SetWindowTextW(g_hwndMain, animTitle.c_str());
+    UpdateWindow(g_hwndMain);             // force the change to show ASAP
+
+    static const wchar_t kAnimFrames[4] = { L' ', L'.', L'o', L'O' };
+    DWORD lastAnimTick = GetTickCount();
+    int   animFrame = 1;                  // after ~1 second show '.' first
 
     SendMessageW(g_hwndList, WM_SETREDRAW, FALSE, 0);
     LV_ResetColumns();
@@ -1297,9 +1484,12 @@ static void ShowFolder(std::wstring abs) {
         FindExSearchNameMatch,
         NULL,
         FIND_FIRST_EX_LARGE_FETCH);
+
     if (h == INVALID_HANDLE_VALUE) {
         SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(g_hwndList, NULL, TRUE);
+
+        // End cleanly (no spinner char left behind)
         SetTitleFolderOrDrives();
         return;
     }
@@ -1326,6 +1516,20 @@ static void ShowFolder(std::wstring abs) {
             }
             vids.push_back(r);
         }
+
+        // ------------------------------------------------------------
+        // NEW: pump messages + update 1-char spinner once per second
+        // ------------------------------------------------------------
+        PumpMessagesThrottled(50); // keeps app responsive (prevents "Not Responding")
+
+        DWORD now = GetTickCount();
+        if (now - lastAnimTick >= 1000) {
+            animTitle.back() = kAnimFrames[animFrame & 3];
+            ++animFrame;
+            SetWindowTextW(g_hwndMain, animTitle.c_str());
+            lastAnimTick = now;
+        }
+
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 
@@ -1341,6 +1545,7 @@ static void ShowFolder(std::wstring abs) {
     // Queue remaining metadata and kick worker
     QueueMissingPropsAndKickWorker();
 
+    // End cleanly on space / remove spinner by restoring normal title
     SetTitleFolderOrDrives();
 }
 
@@ -1457,7 +1662,7 @@ static void ShowSearchResults(const std::vector<Row>& results) {
     InvalidateRect(g_hwndList, NULL, TRUE);
 
     // Title includes terms; also show count
-    std::wstring t = L"Media Explorer (libVLC) - Search - " + JoinTermsForTitle();
+    std::wstring t = L"Media Explorer - Search - " + JoinTermsForTitle();
     wchar_t buf[64]; swprintf_s(buf, L" - %zu file(s)", g_rows.size());
     t += buf;
     SetWindowTextW(g_hwndMain, t.c_str());
@@ -1765,6 +1970,8 @@ static void Browser_DeleteSelected() {
 
 // Move a single selected row up or down in the current list.
 // direction = -1 (up) or +1 (down). Only works when exactly one row is selected.
+// Move a single selected row up or down in the current list WITHOUT rebuilding the whole view.
+// direction = -1 (up) or +1 (down). Only works when exactly one row is selected.
 static void Browser_MoveSelectedRow(int direction) {
     if (g_view == ViewKind::Drives) return;
     if (direction != -1 && direction != +1) return;
@@ -1772,20 +1979,33 @@ static void Browser_MoveSelectedRow(int direction) {
 
     int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
     if (sel < 0) return;
+
+    // Only support a single selected row for reordering
     if (ListView_GetNextItem(g_hwndList, sel, LVNI_SELECTED) != -1) {
-        // More than one selected – ambiguous order, ignore
         return;
     }
 
     int target = sel + direction;
     if (target < 0 || target >= (int)g_rows.size()) return;
 
+    // Swap data in our model
     std::swap(g_rows[sel], g_rows[target]);
-    LV_Rebuild();
 
+    // Update just those two rows in the ListView
+    SendMessageW(g_hwndList, WM_SETREDRAW, FALSE, 0);
+
+    LV_UpdateRow(sel, g_rows[sel]);
+    LV_UpdateRow(target, g_rows[target]);
+
+    // Move selection to the new position
+    ListView_SetItemState(g_hwndList, sel,
+        0, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_SetItemState(g_hwndList, target,
         LVIS_SELECTED | LVIS_FOCUSED,
         LVIS_SELECTED | LVIS_FOCUSED);
+
+    SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_hwndList, NULL, FALSE);
     ListView_EnsureVisible(g_hwndList, target, FALSE);
 }
 
@@ -2251,7 +2471,7 @@ static void ApplyPostActionsAndRefresh() {
             break;
         }
         case ActionType::CopyToPath: {
-            std::wstring t = L"Media Explorer (libVLC) - copying file...";
+            std::wstring t = L"Media Explorer - copying file...";
             SetWindowTextW(g_hwndMain, t.c_str());
             BOOL ok = CopyFileW(a.src.c_str(), a.param.c_str(), FALSE);
             DWORD err = ok ? 0 : GetLastError();
@@ -2393,7 +2613,7 @@ static void FinalizeAllFfmpegTasks() {
         if (!t) continue;
         if (t->hProcess) CloseHandle(t->hProcess);
         if (t->hThread) CloseHandle(t->hThread);
-        if (t->hwnd && IsWindow(t->hwnd)) DestroyWindow(t->hwnd);
+//        if (t->hwnd && IsWindow(t->hwnd)) DestroyWindow(t->hwnd);
         delete t;
     }
     g_ffTasks.clear();
@@ -2425,7 +2645,7 @@ static void WaitForFfmpegTasksAndFinalize() {
             if (remaining <= 0) break;
 
             wchar_t buf[256];
-            swprintf_s(buf, L"Media Explorer (libVLC) - waiting on %d FFmpeg task(s)...", remaining);
+            swprintf_s(buf, L"Media Explorer - waiting on %d FFmpeg task(s)...", remaining);
             SetWindowTextW(g_hwndMain, buf);
 
             MSG msg;
@@ -2464,6 +2684,8 @@ static void ExitPlayback() {
     ApplyPostActionsAndRefresh();
     SetTitleFolderOrDrives();
     LogLine(L"ExitPlayback finished");
+    // NEW: bring back any log windows we hid when playback started
+    RestoreLogWindowsAfterPlayback();
 }
 
 static void NextInPlaylist() {
@@ -2476,6 +2698,9 @@ static void PrevInPlaylist() {
 }
 
 static void PlaySelectedVideos() {
+    // NEW: hide any combine/ffmpeg log windows while we are in playback
+    HideAllLogWindowsForPlayback();
+
     g_playlist.clear();
     int idx = -1;
     while ((idx = ListView_GetNextItem(g_hwndList, idx, LVNI_SELECTED)) != -1) {
@@ -2657,6 +2882,20 @@ static HWND CreateCombineLogWindow(CombineTask* task) {
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"CombineLogClass", title.c_str(),
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         X, Y, W, H, g_hwndMain, NULL, g_hInst, task);
+
+    if (hwnd && task)
+    {
+        task->hwnd = hwnd;
+
+        // If playback is already active when this window is created,
+        // keep it hidden and mark it so we restore it at playback exit.
+        if (g_inPlayback)
+        {
+            if (IsWindowVisible(hwnd))
+                ShowWindow(hwnd, SW_HIDE);
+            task->hiddenByPlayback = true;
+        }
+    }
     return hwnd;
 }
 
@@ -3681,6 +3920,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     case WM_CLOSE:
+        if (g_loadingFolder) {
+            // Avoid tearing down the window while ShowFolder is mid-loop
+            MessageBoxW(h, L"Loading folder... please wait.", L"Media Explorer", MB_OK);
+            return 0;
+        }
         if (HasRunningCombineTasks() || HasRunningFfmpegTasks()) {
             MessageBoxW(h,
                 L"Background video operations are still running.\n"
@@ -3759,7 +4003,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassExW(&wc);
 
-    g_hwndMain = CreateWindowExW(0, wc.lpszClassName, L"Media Explorer (libVLC)",
+    g_hwndMain = CreateWindowExW(0, wc.lpszClassName, L"Media Explorer ",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 1500, 700,
         NULL, NULL, hInst, NULL);
 
