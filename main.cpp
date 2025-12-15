@@ -327,6 +327,57 @@ static void RestoreLogWindowsAfterPlayback()
     LeaveCriticalSection(&g_ffLock);
 }
 
+// --- NEW: "Media created" time helper (metadata if available; else filesystem create time)
+static bool PropVarToFileTime(const PROPVARIANT& v, FILETIME& outFt)
+{
+    outFt.dwLowDateTime = outFt.dwHighDateTime = 0;
+
+    if (v.vt == VT_FILETIME) {
+        outFt = v.filetime;
+        return (outFt.dwLowDateTime || outFt.dwHighDateTime);
+    }
+    // Some properties can come back as a raw 64-bit filetime
+    if (v.vt == VT_UI8) {
+        ULARGE_INTEGER uli{};
+        uli.QuadPart = v.uhVal.QuadPart;
+        outFt.dwLowDateTime = uli.LowPart;
+        outFt.dwHighDateTime = uli.HighPart;
+        return (outFt.dwLowDateTime || outFt.dwHighDateTime);
+    }
+    return false;
+}
+
+static bool GetMediaCreatedTime(const std::wstring& path, FILETIME& outFt, bool& outFromMetadata)
+{
+    outFromMetadata = false;
+    outFt.dwLowDateTime = outFt.dwHighDateTime = 0;
+
+    // 1) Prefer media metadata: System.Media.DateEncoded
+    ComPtr<IShellItem2> item;
+    if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), NULL, IID_PPV_ARGS(&item)))) {
+        ComPtr<IPropertyStore> store;
+        if (SUCCEEDED(item->GetPropertyStore(GPS_DEFAULT, IID_PPV_ARGS(&store)))) {
+            PROPVARIANT v; PropVariantInit(&v);
+            HRESULT hr = store->GetValue(PKEY_Media_DateEncoded, &v);
+            if (SUCCEEDED(hr) && PropVarToFileTime(v, outFt)) {
+                outFromMetadata = true;
+                PropVariantClear(&v);
+                return true;
+            }
+            PropVariantClear(&v);
+        }
+    }
+
+    // 2) Fallback: filesystem creation time
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        outFt = fad.ftCreationTime;
+        return (outFt.dwLowDateTime || outFt.dwHighDateTime);
+    }
+
+    return false;
+}
+
 
 // ----------------------------- FFmpeg task log window + helpers
 
@@ -1079,6 +1130,17 @@ static void ShowCurrentVideoProperties() {
         msg += L"\nNote: ffprobe-based details are disabled in mediaexplorer.ini.";
     }
 
+    FILETIME ft{};
+    bool fromMeta = false;
+    if (GetMediaCreatedTime(full, ft, fromMeta)) {
+        msg += L"\nMedia created: ";
+        msg += FormatFileTime(ft);
+        msg += fromMeta ? L" (metadata)" : L" (file)";
+        msg += L"\n";
+    }
+    else {
+        msg += L"\nMedia created: (unknown)\n";
+    }
     // Show dialog WHILE paused
     MessageBoxW(g_hwndMain, msg.c_str(), L"Video properties", MB_OK);
 
@@ -2010,16 +2072,22 @@ static void Browser_MoveSelectedRow(int direction) {
 }
 
 // Prompt for combined output filename, forcing it into the current folder (g_folder).
-static bool PromptCombinedOutputName(const std::wstring& defaultName, std::wstring& outFullPath) {
-    if (g_view != ViewKind::Folder) return false;
-    if (g_folder.empty()) return false;
+// Prompt for combined output filename, forcing it into a chosen base folder.
+// (Folder view uses g_folder; Search view uses origin folder or first selected file's folder.)
+static bool PromptCombinedOutputName(const std::wstring& baseFolder,
+    const std::wstring& defaultName,
+    std::wstring& outFullPath)
+{
+    if (baseFolder.empty()) return false;
+
+    std::wstring folder = EnsureSlash(baseFolder);
 
     ComPtr<IFileSaveDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
         return false;
 
     ComPtr<IShellItem> initFolder;
-    if (SUCCEEDED(SHCreateItemFromParsingName(g_folder.c_str(), NULL, IID_PPV_ARGS(&initFolder)))) {
+    if (SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), NULL, IID_PPV_ARGS(&initFolder)))) {
         dlg->SetFolder(initFolder.Get());
     }
 
@@ -2043,15 +2111,18 @@ static bool PromptCombinedOutputName(const std::wstring& defaultName, std::wstri
     std::wstring chosen(psz);
     CoTaskMemFree(psz);
 
+    // Force output into baseFolder, but keep the user's chosen *filename*.
     const wchar_t* base = wcsrchr(chosen.c_str(), L'\\');
     base = base ? base + 1 : chosen.c_str();
 
-    outFullPath = EnsureSlash(g_folder);
+    outFullPath = folder;
     outFullPath += base;
     return true;
 }
 
 // Combine selected files using external video_combine.exe in background thread.
+// Combine selected files using external video_combine.exe in background thread.
+// Now supports Folder view AND Search view.
 static void Browser_CombineSelected() {
     if (!g_cfg.ffmpegAvailable) {
         MessageBoxW(g_hwndMain,
@@ -2060,28 +2131,50 @@ static void Browser_CombineSelected() {
             L"Combine videos", MB_OK);
         return;
     }
-    if (g_view != ViewKind::Folder) return;
+
+    if (g_view != ViewKind::Folder && g_view != ViewKind::Search) return;
     if (g_rows.empty()) return;
 
     std::vector<int> selIdx;
     int idx = -1;
     while ((idx = ListView_GetNextItem(g_hwndList, idx, LVNI_SELECTED)) != -1) {
         if (idx < 0 || idx >= (int)g_rows.size()) continue;
-        if (g_rows[idx].isDir) continue;
+        if (g_rows[idx].isDir) continue; // (Search never has dirs, but keep safe)
         selIdx.push_back(idx);
     }
-    if (selIdx.size() <= 1) {
-        // Ignore if not more than one file selected
-        return;
-    }
+    if (selIdx.size() <= 1) return; // need at least 2
+
     std::sort(selIdx.begin(), selIdx.end());
 
+    // Build list of source files
     std::vector<std::wstring> srcFiles;
     srcFiles.reserve(selIdx.size());
-    for (int i : selIdx) {
-        srcFiles.push_back(g_rows[i].full);
-    }
+    for (int i : selIdx) srcFiles.push_back(g_rows[i].full);
 
+    // Pick a "base output folder":
+    // - Folder view: current folder
+    // - Search view: origin folder if it was a Folder search, else folder of first selected file
+    std::wstring baseFolder;
+    if (g_view == ViewKind::Folder) {
+        baseFolder = g_folder;
+    }
+    else {
+        if (g_search.active && g_search.originView == ViewKind::Folder && !g_search.originFolder.empty()) {
+            baseFolder = g_search.originFolder;
+        }
+        else {
+            // derive from first selected file
+            std::wstring tmp = srcFiles.front();
+            std::vector<wchar_t> buf(tmp.begin(), tmp.end());
+            buf.push_back(L'\0');
+            PathRemoveFileSpecW(buf.data());
+            baseFolder = buf.data();
+        }
+    }
+    baseFolder = EnsureSlash(baseFolder);
+    if (baseFolder.empty()) return;
+
+    // Default output name based on the first selected file
     const std::wstring& firstFull = srcFiles.front();
     const wchar_t* baseFirst = wcsrchr(firstFull.c_str(), L'\\');
     baseFirst = baseFirst ? baseFirst + 1 : firstFull.c_str();
@@ -2094,11 +2187,14 @@ static void Browser_CombineSelected() {
     std::wstring defaultName = stem + extension;
 
     std::wstring combinedFull;
-    if (!PromptCombinedOutputName(defaultName, combinedFull)) return;
+    if (!PromptCombinedOutputName(baseFolder, defaultName, combinedFull)) return;
 
-    std::wstring folderWithSlash = EnsureSlash(g_folder);
+    // Working dir under the chosen base folder
+    std::wstring folderWithSlash = EnsureSlash(baseFolder);
+
     const wchar_t* baseOut = wcsrchr(combinedFull.c_str(), L'\\');
     std::wstring baseOutName = baseOut ? baseOut + 1 : combinedFull;
+
     size_t dotPos = baseOutName.find_last_of(L'.');
     std::wstring outStem = (dotPos == std::wstring::npos) ? baseOutName : baseOutName.substr(0, dotPos);
 
@@ -2143,8 +2239,8 @@ static void Browser_CombineSelected() {
     task->hThread = hThread;
 
     std::wstring startMsg = L"Starting combine for ";
-    wchar_t buf[64]; swprintf_s(buf, L"%zu", task->srcFiles.size());
-    startMsg += buf;
+    wchar_t buf2[64]; swprintf_s(buf2, L"%zu", task->srcFiles.size());
+    startMsg += buf2;
     startMsg += L" file(s)...\r\nWorking directory: ";
     startMsg += task->workingDir;
     startMsg += L"\r\n";
@@ -3280,8 +3376,12 @@ static DWORD WINAPI CombineThreadProc(LPVOID param) {
         const wchar_t* base = wcsrchr(src.c_str(), L'\\');
         base = base ? base + 1 : src.c_str();
 
-        std::wstring dst = task->workingDir;
-        dst += base;
+        // Make destination unique inside the working directory (important for Search view)
+        wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
+        _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+
+        std::wstring dstFolder = EnsureSlash(task->workingDir);
+        std::wstring dst = UniqueName(dstFolder, fname, ext);
 
         std::wstring line = L"  -> ";
         line += dst;
@@ -3915,6 +4015,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         if (g_view == ViewKind::Folder) {
             ShowFolder(g_folder);
+        }
+        else if (g_view == ViewKind::Search && g_search.active) {
+            std::vector<Row> res;
+            RunSearchFromOrigin(res);
+            ShowSearchResults(res);
         }
         return 0;
     }
