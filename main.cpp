@@ -95,6 +95,26 @@ struct Row {
 };
 std::vector<Row> g_rows;
 
+// ----------------------------- Background folder reload (NEW)
+
+struct FolderReloadResult {
+    uint32_t gen = 0;
+    std::wstring folder;            // ends with '\'
+    int sortCol = 0;
+    bool sortAsc = true;
+    std::vector<Row>* rows = nullptr; // heap; main thread owns
+};
+
+std::atomic<uint32_t> g_folderReloadGen{ 0 };
+
+// Playback-exit batching for file-op tasks (NEW)
+// We only use this to wait until *playback-exit* file ops complete before kicking a background reload.
+static uint32_t     g_pbExitBatchCounter = 0;
+static uint32_t     g_pbExitBatchActive = 0;
+static long         g_pbExitPending = 0;
+static std::wstring g_pbExitFolder;          // ends with '\'
+static bool         g_pbExitWantsReload = false;
+
 static bool g_loadingFolder = false;
 
 // sorting
@@ -170,6 +190,74 @@ constexpr UINT WM_APP_COMBINE_DONE = WM_APP + 201;
 // New for ffmpeg tools
 constexpr UINT WM_APP_FFMPEG_OUTPUT = WM_APP + 300;
 constexpr UINT WM_APP_FFMPEG_DONE = WM_APP + 301;
+// New for background file operations (copy/move/delete/upscale)
+constexpr UINT WM_APP_FILEOP_OUTPUT = WM_APP + 400;
+constexpr UINT WM_APP_FILEOP_DONE = WM_APP + 401;
+// NEW: background folder reload finished
+constexpr UINT WM_APP_FOLDER_RELOAD_DONE = WM_APP + 450;
+
+enum class FileOpKind { ClipboardPaste, DeleteFiles, CopyToPath };
+
+struct FileOpTask {
+    HANDLE hThread = NULL;
+    HWND   hwnd = NULL;     // log window
+    HWND   hEdit = NULL;    // multiline read-only edit
+    HWND   hCancel = NULL;  // cancel button
+
+    // NEW: identify tasks that were scheduled by playback exit
+    bool     fromPlaybackExit = false;
+    uint32_t playbackExitGen = 0;
+
+    FileOpKind kind = FileOpKind::ClipboardPaste;
+
+    // ClipboardPaste
+    ClipMode clipMode = ClipMode::None; // Copy or Move
+    std::vector<std::wstring> srcFiles;
+    std::wstring dstFolder; // ends with '\'
+
+    // CopyToPath
+    std::wstring srcSingle;
+    std::wstring dstPath;
+
+    std::wstring title;
+    std::atomic<bool> cancel{ false };
+    bool running = false;
+    bool done = false;
+    DWORD exitCode = 0;
+    bool hiddenByPlayback = false;
+};
+
+CRITICAL_SECTION g_fileLock;
+std::vector<FileOpTask*> g_fileTasks;
+// ---- Forward decls (needed because Browser_* uses these before their definitions)
+static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder);
+
+static void ScheduleDeleteFilesAsync(const std::vector<std::wstring>& files,
+    const std::wstring& title,
+    bool fromPlaybackExit = false,
+    uint32_t playbackExitGen = 0);
+
+static void ScheduleCopyToPathAsync(const std::wstring& src,
+    const std::wstring& dst,
+    const std::wstring& title,
+    bool fromPlaybackExit = false,
+    uint32_t playbackExitGen = 0);
+
+static void RefreshCurrentView();
+
+// NEW: background folder reload helpers
+static void CancelBackgroundFolderReload();
+static void StartBackgroundFolderReload(const std::wstring& folder);
+
+static bool HasRunningFileOpTasks() {
+    EnterCriticalSection(&g_fileLock);
+    bool any = false;
+    for (FileOpTask* t : g_fileTasks) {
+        if (t && t->running) { any = true; break; }
+    }
+    LeaveCriticalSection(&g_fileLock);
+    return any;
+}
 
 struct MetaResult {
     std::wstring path;
@@ -254,6 +342,7 @@ std::vector<FfmpegTask*> g_ffTasks;
 // watching video fullscreen. We remember which ones we hid so we
 // can restore only those when leaving fullscreen.
 
+
 static bool HasRunningFfmpegTasks() {
     EnterCriticalSection(&g_ffLock);
     bool any = false;
@@ -293,9 +382,20 @@ static void HideAllLogWindowsForPlayback()
         }
     }
     LeaveCriticalSection(&g_ffLock);
+
+    // Background file-op log windows
+    EnterCriticalSection(&g_fileLock);
+    for (FileOpTask* t : g_fileTasks)
+    {
+        if (t && t->hwnd && IsWindow(t->hwnd) && IsWindowVisible(t->hwnd))
+        {
+            t->hiddenByPlayback = true;
+            ShowWindow(t->hwnd, SW_HIDE);
+        }
+    }
+    LeaveCriticalSection(&g_fileLock);
 }
 
-// Restore any log windows that were hidden specifically due to playback.
 static void RestoreLogWindowsAfterPlayback()
 {
     // Combine logs
@@ -325,6 +425,20 @@ static void RestoreLogWindowsAfterPlayback()
         }
     }
     LeaveCriticalSection(&g_ffLock);
+
+    // File-op logs
+    EnterCriticalSection(&g_fileLock);
+    for (FileOpTask* t : g_fileTasks)
+    {
+        if (t && t->hiddenByPlayback && t->hwnd && IsWindow(t->hwnd))
+        {
+            ShowWindow(t->hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(t->hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            t->hiddenByPlayback = false;
+        }
+    }
+    LeaveCriticalSection(&g_fileLock);
 }
 
 // --- NEW: "Media created" time helper (metadata if available; else filesystem create time)
@@ -1440,6 +1554,156 @@ static void SortRows(int col, bool asc) {
     LV_Rebuild();
 }
 
+// ----------------------------- Background folder reload (NEW)
+
+static void CancelBackgroundFolderReload() {
+    // bump generation; any in-flight reload result will be ignored
+    g_folderReloadGen.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void SortRowsVector(std::vector<Row>& rows, int col, bool asc) {
+    std::sort(rows.begin(), rows.end(),
+        [col, asc](const Row& A, const Row& B) {
+            if (A.isDir != B.isDir) return A.isDir && !B.isDir; // dirs first
+            switch (col) {
+            case 0: return asc ? (_wcsicmp(A.name.c_str(), B.name.c_str()) < 0) : (_wcsicmp(A.name.c_str(), B.name.c_str()) > 0);
+            case 1: {
+                int ta = A.isDir ? 0 : 1, tb = B.isDir ? 0 : 1;
+                if (ta != tb) return ta < tb;
+                return asc ? (_wcsicmp(A.name.c_str(), B.name.c_str()) < 0) : (_wcsicmp(A.name.c_str(), B.name.c_str()) > 0);
+            }
+            case 2:
+                if (A.size != B.size) return asc ? (A.size < B.size) : (A.size > B.size);
+                return _wcsicmp(A.name.c_str(), B.name.c_str()) < 0;
+            case 3: {
+                ULONGLONG a = ((ULONGLONG)A.modified.dwHighDateTime << 32) | A.modified.dwLowDateTime;
+                ULONGLONG b = ((ULONGLONG)B.modified.dwHighDateTime << 32) | B.modified.dwLowDateTime;
+                if (a != b) return asc ? (a < b) : (a > b);
+                return _wcsicmp(A.name.c_str(), B.name.c_str()) < 0;
+            }
+            case 4: {
+                ULONGLONG aa = (ULONGLONG)A.vW * (ULONGLONG)A.vH;
+                ULONGLONG bb = (ULONGLONG)B.vW * (ULONGLONG)B.vH;
+                if (aa != bb) return asc ? (aa < bb) : (aa > bb);
+                if (A.vW != B.vW) return asc ? (A.vW < B.vW) : (A.vW > B.vW);
+                return _wcsicmp(A.name.c_str(), B.name.c_str()) < 0;
+            }
+            case 5:
+                if (A.vDur100ns != B.vDur100ns) return asc ? (A.vDur100ns < B.vDur100ns) : (A.vDur100ns > B.vDur100ns);
+                return _wcsicmp(A.name.c_str(), B.name.c_str()) < 0;
+            default:
+                return _wcsicmp(A.name.c_str(), B.name.c_str()) < 0;
+            }
+        });
+}
+
+static void BuildFolderRowsForReload(const std::wstring& folder,
+    std::vector<Row>& out,
+    uint32_t myGen,
+    int sortCol,
+    bool sortAsc)
+{
+    out.clear();
+    std::wstring abs = EnsureSlash(folder);
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileExW((abs + L"*").c_str(),
+        FindExInfoBasic,
+        &fd,
+        FindExSearchNameMatch,
+        NULL,
+        FIND_FIRST_EX_LARGE_FETCH);
+
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    std::vector<Row> dirs, vids;
+    do {
+        if (myGen != g_folderReloadGen.load(std::memory_order_relaxed)) break;
+
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+        Row r;
+        r.name = fd.cFileName;
+        r.full = abs + fd.cFileName;
+        r.isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        r.modified = fd.ftLastWriteTime;
+
+        if (r.isDir) {
+            r.full += L'\\';
+            dirs.push_back(std::move(r));
+        }
+        else if (IsVideoFile(r.full)) {
+            ULARGE_INTEGER uli{};
+            uli.HighPart = fd.nFileSizeHigh;
+            uli.LowPart = fd.nFileSizeLow;
+            r.size = uli.QuadPart;
+
+            if (!GetVideoPropsFastCached(r.full, r.vW, r.vH, r.vDur100ns)) {
+                r.vW = r.vH = 0;
+                r.vDur100ns = 0;
+            }
+            vids.push_back(std::move(r));
+        }
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+
+    out.reserve(dirs.size() + vids.size());
+    out.insert(out.end(), dirs.begin(), dirs.end());
+    out.insert(out.end(), vids.begin(), vids.end());
+
+    SortRowsVector(out, sortCol, sortAsc);
+}
+
+static DWORD WINAPI FolderReloadThreadProc(LPVOID param) {
+    FolderReloadResult* res = (FolderReloadResult*)param;
+    if (!res) return 0;
+
+    const uint32_t myGen = res->gen;
+    const int sortCol = res->sortCol;
+    const bool sortAsc = res->sortAsc;
+    const std::wstring f = EnsureSlash(res->folder);
+
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    std::vector<Row>* rows = new std::vector<Row>();
+    BuildFolderRowsForReload(f, *rows, myGen, sortCol, sortAsc);
+
+    CoUninitialize();
+
+    res->rows = rows;
+
+    HWND hwnd = g_hwndMain;
+    if (hwnd && IsWindow(hwnd)) {
+        PostMessageW(hwnd, WM_APP_FOLDER_RELOAD_DONE, 0, (LPARAM)res);
+    }
+    else {
+        delete rows;
+        delete res;
+    }
+    return 0;
+}
+
+static void StartBackgroundFolderReload(const std::wstring& folder) {
+    if (folder.empty()) return;
+
+    // cancel any previous reload and start a new generation
+    CancelBackgroundFolderReload();
+
+    FolderReloadResult* res = new FolderReloadResult();
+    res->folder = EnsureSlash(folder);
+    res->gen = g_folderReloadGen.load(std::memory_order_relaxed);
+    res->sortCol = g_sortCol;
+    res->sortAsc = g_sortAsc;
+
+    HANDLE th = CreateThread(NULL, 0, FolderReloadThreadProc, res, 0, NULL);
+    if (!th) {
+        delete res;
+        return;
+    }
+    CloseHandle(th); // detached
+}
+
 // ----------------------------- Async metadata worker
 static DWORD WINAPI MetaThreadProc(LPVOID) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1491,6 +1755,7 @@ static void QueueMissingPropsAndKickWorker() {
 
 // ----------------------------- Populate views
 static void ShowDrives() {
+    CancelBackgroundFolderReload(); // NEW
     CancelMetaWorkAndClearTodo();
 
     g_view = ViewKind::Drives; g_folder.clear(); g_rows.clear();
@@ -1513,6 +1778,7 @@ static void ShowDrives() {
 }
 
 static void ShowFolder(std::wstring abs) {
+    CancelBackgroundFolderReload(); // NEW
     CancelMetaWorkAndClearTodo();
 
     if (abs.size() == 2 && abs[1] == L':') abs += L'\\';
@@ -1712,6 +1978,7 @@ static void RunSearchFromOrigin(std::vector<Row>& outResults) {
     }
 }
 static void ShowSearchResults(const std::vector<Row>& results) {
+    CancelBackgroundFolderReload(); // NEW
     CancelMetaWorkAndClearTodo();
 
     g_view = ViewKind::Search;
@@ -2004,30 +2271,34 @@ static void RunClipboardOperationWithUI(const std::wstring& dstFolder) {
 }
 
 static void Browser_PasteClipboardIntoCurrent() {
-    if ((g_view != ViewKind::Folder && g_view != ViewKind::Search) || g_clipMode == ClipMode::None || g_clipFiles.empty()) return;
+    if ((g_view != ViewKind::Folder && g_view != ViewKind::Search) ||
+        g_clipMode == ClipMode::None || g_clipFiles.empty())
+        return;
 
     std::wstring dstFolder;
     if (g_view == ViewKind::Folder) dstFolder = g_folder;
     else if (g_view == ViewKind::Search && g_search.originView == ViewKind::Folder) dstFolder = g_search.originFolder;
     else return;
 
-    RunClipboardOperationWithUI(dstFolder);
+    ScheduleClipboardPasteAsync(dstFolder);
 }
 
 static void Browser_DeleteSelected() {
     if (g_view == ViewKind::Drives) return;
+
     if (MessageBoxW(g_hwndMain, L"Delete selected files permanently?", L"Confirm Delete",
         MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
 
+    std::vector<std::wstring> doomed;
     int idx = -1;
     while ((idx = ListView_GetNextItem(g_hwndList, idx, LVNI_SELECTED)) != -1) {
         if (idx < 0 || idx >= (int)g_rows.size()) continue;
         const Row& r = g_rows[idx];
-        if (!r.isDir && PathFileExistsW(r.full.c_str())) {
-            if (!DeleteFileW(r.full.c_str())) MoveFileExW(r.full.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-        }
+        if (!r.isDir) doomed.push_back(r.full);
     }
-    if (g_view == ViewKind::Folder) ShowFolder(g_folder);
+    if (doomed.empty()) return;
+
+    ScheduleDeleteFilesAsync(doomed, L"Delete selected files");
 }
 
 // Move a single selected row up or down in the current list.
@@ -2541,51 +2812,88 @@ static bool PromptKeyword(std::wstring& out) {
 }
 
 // ----------------------------- Playback
-static void ApplyPostActionsAndRefresh() {
+static void ApplyPostActionsAndRefresh(bool hadFfmpegTasks) {
+    // We no longer rebuild the folder/search view here.
+    // We return immediately to the existing list (cached), then (optionally)
+    // do a background reload once playback-exit file ops finish.
+
+    const bool inFolderView = (g_view == ViewKind::Folder && !g_folder.empty());
+    int fileOpsScheduled = 0;
+
+    // Count how many background file ops we will schedule (DeleteFile + CopyToPath)
+    for (const auto& a : g_post) {
+        if (a.type == ActionType::DeleteFile) ++fileOpsScheduled;
+        else if (a.type == ActionType::CopyToPath) ++fileOpsScheduled;
+        // RenameFile is synchronous (MoveFileEx) in your current design
+    }
+
+    // Decide if we want a folder reload at all:
+    // - Only for Folder view
+    // - Only if something likely changed (ffmpeg ran, rename ran, or we scheduled playback-exit file ops)
+    bool wantsFolderReload = inFolderView && (hadFfmpegTasks || fileOpsScheduled > 0);
+
+    // If we scheduled file ops, we wait for them to finish before background reload.
+    uint32_t batchGen = 0;
+    if (wantsFolderReload && fileOpsScheduled > 0) {
+        g_pbExitBatchActive = ++g_pbExitBatchCounter;
+        g_pbExitPending = fileOpsScheduled;
+        g_pbExitFolder = g_folder;
+        g_pbExitWantsReload = true;
+        batchGen = g_pbExitBatchActive;
+    }
+
+    // Run post actions:
     for (size_t i = 0; i < g_post.size(); ++i) {
         const PostAction& a = g_post[i];
         switch (a.type) {
         case ActionType::DeleteFile: {
-            BOOL ok = DeleteFileW(a.src.c_str());
-            if (!ok) {
-                DWORD err = GetLastError();
-                MoveFileExW(a.src.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-                LogLine(L"PostAction DeleteFile: src=\"%s\" FAILED err=%lu (queued delete on reboot)",
-                    a.src.c_str(), err);
-            }
-            else {
-                LogLine(L"PostAction DeleteFile: src=\"%s\" OK", a.src.c_str());
-            }
+            std::vector<std::wstring> one{ a.src };
+
+            const wchar_t* base = wcsrchr(a.src.c_str(), L'\\');
+            base = base ? base + 1 : a.src.c_str();
+
+            std::wstring title = L"Delete: ";
+            title += base;
+
+            // Mark as playback-exit so WM_APP_FILEOP_DONE won't do an expensive foreground refresh.
+            ScheduleDeleteFilesAsync(one, title, true, batchGen);
             break;
         }
         case ActionType::RenameFile: {
+            // Synchronous (as you already do)
             BOOL ok = MoveFileExW(a.src.c_str(), a.param.c_str(),
                 MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING);
             DWORD err = ok ? 0 : GetLastError();
             LogLine(L"PostAction RenameFile: src=\"%s\" dst=\"%s\" %s err=%lu",
                 a.src.c_str(), a.param.c_str(), ok ? L"OK" : L"FAILED", err);
+
+            // A rename changes the folder; we want a reload if we're in folder view.
+            if (inFolderView) wantsFolderReload = true;
             break;
         }
         case ActionType::CopyToPath: {
-            std::wstring t = L"Media Explorer - copying file...";
-            SetWindowTextW(g_hwndMain, t.c_str());
-            BOOL ok = CopyFileW(a.src.c_str(), a.param.c_str(), FALSE);
-            DWORD err = ok ? 0 : GetLastError();
-            LogLine(L"PostAction CopyToPath: src=\"%s\" dst=\"%s\" %s err=%lu",
-                a.src.c_str(), a.param.c_str(), ok ? L"OK" : L"FAILED", err);
+            const wchar_t* base = wcsrchr(a.src.c_str(), L'\\');
+            base = base ? base + 1 : a.src.c_str();
+
+            std::wstring title = L"Copy: ";
+            title += base;
+
+            // Mark as playback-exit so WM_APP_FILEOP_DONE won't do an expensive foreground refresh.
+            ScheduleCopyToPathAsync(a.src, a.param, title, true, batchGen);
             break;
         }
         }
     }
     g_post.clear();
 
-    if (g_view == ViewKind::Search && g_search.active) {
-        std::vector<Row> res;
-        RunSearchFromOrigin(res);
-        ShowSearchResults(res);
+    // If we want a folder reload but did NOT schedule any async file ops,
+    // do it immediately in the background (still only if we're still on same folder later).
+    if (wantsFolderReload && fileOpsScheduled == 0) {
+        StartBackgroundFolderReload(g_folder);
     }
-    else if (g_view == ViewKind::Drives) ShowDrives();
-    else ShowFolder(g_folder);
+
+    // IMPORTANT: Do NOT call ShowFolder / ShowSearchResults here.
+    // That is what was causing the slow, synchronous disk rebuild on ESC.
 }
 
 static void PlayIndex(size_t idx) {
@@ -2765,6 +3073,12 @@ static void ExitPlayback() {
     KillTimer(g_hwndMain, kTimerPlaybackUI);
     if (g_mp) libvlc_media_player_stop(g_mp);
 
+    // Snapshot whether FFmpeg tasks ran (WaitForFfmpegTasksAndFinalize clears g_ffTasks)
+    bool hadFfmpegTasks = false;
+    EnterCriticalSection(&g_ffLock);
+    hadFfmpegTasks = !g_ffTasks.empty();
+    LeaveCriticalSection(&g_ffLock);
+
     // Wait for any pending FFmpeg tasks and finalize them
     WaitForFfmpegTasksAndFinalize();
 
@@ -2777,7 +3091,7 @@ static void ExitPlayback() {
     RECT rc; GetClientRect(g_hwndMain, &rc);
     MoveWindow(g_hwndList, 0, 0, rc.right, rc.bottom, TRUE);
 
-    ApplyPostActionsAndRefresh();
+    ApplyPostActionsAndRefresh(hadFfmpegTasks);
     SetTitleFolderOrDrives();
     LogLine(L"ExitPlayback finished");
     // NEW: bring back any log windows we hid when playback started
@@ -2794,6 +3108,7 @@ static void PrevInPlaylist() {
 }
 
 static void PlaySelectedVideos() {
+    CancelBackgroundFolderReload(); // NEW
     // NEW: hide any combine/ffmpeg log windows while we are in playback
     HideAllLogWindowsForPlayback();
 
@@ -2999,6 +3314,373 @@ static void PostCombineOutput(CombineTask* task, const std::wstring& text) {
     if (!task) return;
     std::wstring* p = new std::wstring(text);
     PostMessageW(g_hwndMain, WM_APP_COMBINE_OUTPUT, (WPARAM)task, (LPARAM)p);
+}
+
+// ----------------------------- File-op log window + background thread
+
+static LRESULT CALLBACK FileOpLogProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    FileOpTask* task = reinterpret_cast<FileOpTask*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+
+    switch (m) {
+    case WM_CREATE: {
+        LPCREATESTRUCT pcs = (LPCREATESTRUCT)l;
+        task = (FileOpTask*)pcs->lpCreateParams;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)task);
+
+        HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        RECT rc; GetClientRect(h, &rc);
+
+        const int margin = 6;
+        const int btnW = 100, btnH = 28;
+
+        HWND hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            rc.right - margin - btnW, rc.bottom - margin - btnH, btnW, btnH,
+            h, (HMENU)IDCANCEL, g_hInst, NULL);
+        SendMessageW(hCancel, WM_SETFONT, (WPARAM)hf, TRUE);
+
+        HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+            margin, margin, rc.right - 2 * margin, rc.bottom - 3 * margin - btnH,
+            h, (HMENU)101, g_hInst, NULL);
+        SendMessageW(hEdit, WM_SETFONT, (WPARAM)hf, TRUE);
+
+        if (task) { task->hEdit = hEdit; task->hCancel = hCancel; }
+        return 0;
+    }
+    case WM_SIZE: {
+        if (task) {
+            RECT rc; GetClientRect(h, &rc);
+            const int margin = 6;
+            const int btnW = 100, btnH = 28;
+            if (task->hCancel) MoveWindow(task->hCancel,
+                rc.right - margin - btnW, rc.bottom - margin - btnH, btnW, btnH, TRUE);
+            if (task->hEdit) MoveWindow(task->hEdit,
+                margin, margin, rc.right - 2 * margin, rc.bottom - 3 * margin - btnH, TRUE);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDCANCEL) {
+            if (task) {
+                task->cancel.store(true, std::memory_order_relaxed);
+                if (task->hCancel) EnableWindow(task->hCancel, FALSE);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE); // hide, don't destroy; preserve log
+        return 0;
+    }
+
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void EnsureFileOpLogClass() {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc{}; wc.lpfnWndProc = FileOpLogProc; wc.hInstance = g_hInst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"FileOpLogClass";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+}
+
+static HWND CreateFileOpLogWindow(FileOpTask* task) {
+    RECT r; SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0);
+    int W = 720, H = 520;
+    int X = r.left + ((r.right - r.left) - W) / 2;
+    int Y = r.top + ((r.bottom - r.top) - H) / 2;
+
+    std::wstring title = L"File op: ";
+    title += task ? task->title : L"(unknown)";
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"FileOpLogClass", title.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        X, Y, W, H, g_hwndMain, NULL, g_hInst, task);
+
+    if (hwnd && task) {
+        task->hwnd = hwnd;
+        if (g_inPlayback) {
+            if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+            task->hiddenByPlayback = true;
+        }
+    }
+    return hwnd;
+}
+
+static void PostFileOpOutput(FileOpTask* task, const std::wstring& text) {
+    if (!task) return;
+    std::wstring* p = new std::wstring(text);
+    PostMessageW(g_hwndMain, WM_APP_FILEOP_OUTPUT, (WPARAM)task, (LPARAM)p);
+}
+
+static DWORD CALLBACK FileOpCopyProgressThunk(
+    LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER,
+    DWORD, DWORD, HANDLE, HANDLE, LPVOID lpData)
+{
+    FileOpTask* task = (FileOpTask*)lpData;
+    if (task && task->cancel.load(std::memory_order_relaxed)) return PROGRESS_CANCEL;
+    return PROGRESS_CONTINUE;
+}
+
+static DWORD WINAPI FileOpThreadProc(LPVOID param) {
+    FileOpTask* task = (FileOpTask*)param;
+    if (!task) return 0;
+
+    PostFileOpOutput(task, L"Starting...\r\n\r\n");
+
+    DWORD rc = 0;
+
+    if (task->kind == FileOpKind::ClipboardPaste) {
+        const bool isCopy = (task->clipMode == ClipMode::Copy);
+        const size_t total = task->srcFiles.size();
+
+        for (size_t i = 0; i < total; ++i) {
+            if (task->cancel.load(std::memory_order_relaxed)) { rc = ERROR_CANCELLED; break; }
+
+            const std::wstring& src = task->srcFiles[i];
+            const wchar_t* base = wcsrchr(src.c_str(), L'\\'); base = base ? base + 1 : src.c_str();
+
+            wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
+            _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+
+            std::wstring dst = UniqueName(task->dstFolder, fname, ext);
+
+            {
+                wchar_t hdr[256];
+                swprintf_s(hdr, L"%s %zu of %zu:\r\n",
+                    isCopy ? L"Copying" : L"Moving", i + 1, total);
+                PostFileOpOutput(task, hdr);
+                PostFileOpOutput(task, L"  From: " + src + L"\r\n");
+                PostFileOpOutput(task, L"  To  : " + dst + L"\r\n");
+            }
+
+            BOOL ok = FALSE;
+            DWORD err = 0;
+
+            if (isCopy) {
+                BOOL cancelFlag = FALSE;
+                ok = CopyFileExW(src.c_str(), dst.c_str(),
+                    FileOpCopyProgressThunk, task, &cancelFlag, 0);
+                if (!ok) err = GetLastError();
+                if (cancelFlag || task->cancel.load()) { rc = ERROR_CANCELLED; break; }
+            }
+            else {
+                if (SameVolume(src, dst)) {
+                    ok = MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING);
+                    if (!ok) err = GetLastError();
+                }
+                else {
+                    BOOL cancelFlag = FALSE;
+                    ok = CopyFileExW(src.c_str(), dst.c_str(),
+                        FileOpCopyProgressThunk, task, &cancelFlag, 0);
+                    if (!ok) err = GetLastError();
+                    if (cancelFlag || task->cancel.load()) { rc = ERROR_CANCELLED; break; }
+
+                    if (ok) {
+                        if (!DeleteFileW(src.c_str())) {
+                            MoveFileExW(src.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+                        }
+                    }
+                    else {
+                        DeleteFileW(dst.c_str());
+                    }
+                }
+            }
+
+            if (!ok) {
+                wchar_t buf[256];
+                swprintf_s(buf, L"ERROR: operation failed (err=%lu)\r\n\r\n", err);
+                PostFileOpOutput(task, buf);
+                rc = (err ? err : 1);
+                // keep going or stop? (I stop on first failure)
+                break;
+            }
+
+            PostFileOpOutput(task, L"OK\r\n\r\n");
+        }
+    }
+    else if (task->kind == FileOpKind::DeleteFiles) {
+        const size_t total = task->srcFiles.size();
+        for (size_t i = 0; i < total; ++i) {
+            if (task->cancel.load(std::memory_order_relaxed)) { rc = ERROR_CANCELLED; break; }
+
+            const std::wstring& p = task->srcFiles[i];
+
+            wchar_t hdr[256];
+            swprintf_s(hdr, L"Deleting %zu of %zu:\r\n", i + 1, total);
+            PostFileOpOutput(task, hdr);
+            PostFileOpOutput(task, L"  " + p + L"\r\n");
+
+            if (!DeleteFileW(p.c_str())) {
+                DWORD err = GetLastError();
+                MoveFileExW(p.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+
+                wchar_t buf[256];
+                swprintf_s(buf, L"  FAILED (err=%lu) -> queued delete on reboot\r\n\r\n", err);
+                PostFileOpOutput(task, buf);
+
+                // keep going
+                if (rc == 0) rc = err ? err : 1;
+            }
+            else {
+                PostFileOpOutput(task, L"  OK\r\n\r\n");
+            }
+        }
+    }
+    else if (task->kind == FileOpKind::CopyToPath) {
+        if (task->srcSingle.empty() || task->dstPath.empty()) {
+            PostFileOpOutput(task, L"ERROR: missing src/dst.\r\n");
+            rc = 2;
+        }
+        else {
+            PostFileOpOutput(task, L"Copying:\r\n  From: " + task->srcSingle + L"\r\n  To  : " + task->dstPath + L"\r\n\r\n");
+
+            BOOL cancelFlag = FALSE;
+            BOOL ok = CopyFileExW(task->srcSingle.c_str(), task->dstPath.c_str(),
+                FileOpCopyProgressThunk, task, &cancelFlag, 0);
+
+            if (!ok) {
+                DWORD err = GetLastError();
+                if (cancelFlag || task->cancel.load()) rc = ERROR_CANCELLED;
+                else rc = err ? err : 1;
+
+                wchar_t buf[256];
+                swprintf_s(buf, L"ERROR: copy failed (err=%lu)\r\n", (unsigned long)rc);
+                PostFileOpOutput(task, buf);
+            }
+            else {
+                PostFileOpOutput(task, L"OK\r\n");
+                rc = 0;
+            }
+        }
+    }
+
+    if (rc == ERROR_CANCELLED) {
+        PostFileOpOutput(task, L"\r\n[CANCELLED]\r\n");
+    }
+
+    wchar_t doneMsg[128];
+    swprintf_s(doneMsg, L"\r\n[done rc=%lu]\r\n", (unsigned long)rc);
+    PostFileOpOutput(task, doneMsg);
+
+    task->exitCode = rc;
+    task->running = false;
+    task->done = true;
+
+    PostMessageW(g_hwndMain, WM_APP_FILEOP_DONE, (WPARAM)task, (LPARAM)rc);
+    return 0;
+}
+
+// Helper: refresh current view without forcing a specific folder
+static void RefreshCurrentView() {
+    if (g_inPlayback) return;
+    if (g_view == ViewKind::Search && g_search.active) {
+        std::vector<Row> res;
+        RunSearchFromOrigin(res);
+        ShowSearchResults(res);
+    }
+    else if (g_view == ViewKind::Drives) {
+        ShowDrives();
+    }
+    else {
+        ShowFolder(g_folder);
+    }
+}
+
+static void StartFileOpTask(FileOpTask* task) {
+    if (!task) return;
+
+    EnsureFileOpLogClass();
+    HWND logWnd = CreateFileOpLogWindow(task);
+    if (!logWnd) {
+        delete task;
+        MessageBoxW(g_hwndMain, L"Failed to create file-op log window.", L"File operation", MB_OK);
+        return;
+    }
+    task->hwnd = logWnd;
+
+    EnterCriticalSection(&g_fileLock);
+    g_fileTasks.push_back(task);
+    LeaveCriticalSection(&g_fileLock);
+
+    HANDLE hThread = CreateThread(NULL, 0, FileOpThreadProc, task, 0, NULL);
+    if (!hThread) {
+        EnterCriticalSection(&g_fileLock);
+        auto it = std::find(g_fileTasks.begin(), g_fileTasks.end(), task);
+        if (it != g_fileTasks.end()) g_fileTasks.erase(it);
+        LeaveCriticalSection(&g_fileLock);
+
+        if (IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
+        delete task;
+
+        MessageBoxW(g_hwndMain, L"Failed to start background file-op thread.", L"File operation", MB_OK);
+        return;
+    }
+
+    task->hThread = hThread;
+}
+
+static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder) {
+    if (g_clipMode == ClipMode::None || g_clipFiles.empty()) return;
+
+    FileOpTask* task = new FileOpTask();
+    task->kind = FileOpKind::ClipboardPaste;
+    task->clipMode = g_clipMode;
+    task->srcFiles = g_clipFiles;
+    task->dstFolder = EnsureSlash(dstFolder);
+    task->title = (g_clipMode == ClipMode::Copy) ? L"Paste (Copy)" : L"Paste (Move)";
+    task->running = true;
+
+    // consume clipboard immediately (matches your current behavior)
+    g_clipFiles.clear();
+    g_clipMode = ClipMode::None;
+
+    StartFileOpTask(task);
+}
+
+static void ScheduleDeleteFilesAsync(const std::vector<std::wstring>& files,
+    const std::wstring& title,
+    bool fromPlaybackExit,
+    uint32_t playbackExitGen)
+{
+    if (files.empty()) return;
+    FileOpTask* task = new FileOpTask();
+    task->kind = FileOpKind::DeleteFiles;
+    task->srcFiles = files;
+    task->title = title.empty() ? L"Delete files" : title;
+    task->running = true;
+
+    task->fromPlaybackExit = fromPlaybackExit;
+    task->playbackExitGen = playbackExitGen;
+
+    StartFileOpTask(task);
+}
+
+
+static void ScheduleCopyToPathAsync(const std::wstring& src,
+    const std::wstring& dst,
+    const std::wstring& title,
+    bool fromPlaybackExit,
+    uint32_t playbackExitGen)
+{
+    if (src.empty() || dst.empty()) return;
+    FileOpTask* task = new FileOpTask();
+    task->kind = FileOpKind::CopyToPath;
+    task->srcSingle = src;
+    task->dstPath = dst;
+    task->title = title.empty() ? L"Copy file" : title;
+    task->running = true;
+
+    task->fromPlaybackExit = fromPlaybackExit;
+    task->playbackExitGen = playbackExitGen;
+
+    StartFileOpTask(task);
 }
 
 // -------- Embedded video_combine logic (internal, ffmpeg-based) --------
@@ -3814,6 +4496,7 @@ static HICON LoadAppIcon(int cx, int cy) {
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
+        InitializeCriticalSection(&g_fileLock);
         INITCOMMONCONTROLSEX icc; icc.dwSize = sizeof(icc);
         icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
         InitCommonControlsEx(&icc);
@@ -3919,6 +4602,122 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (g_inPlayback) ExitPlayback();
         return 0;
 
+    case WM_APP_FILEOP_OUTPUT: {
+        FileOpTask* task = (FileOpTask*)w;
+        std::wstring* p = (std::wstring*)l;
+        if (task && task->hEdit && p) {
+            HWND edit = task->hEdit;
+            SendMessageW(edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+            SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)p->c_str());
+            SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+        }
+        if (p && !p->empty()) {
+            LogLine(L"[FileOp] %s", p->c_str());
+        }
+        delete p;
+        return 0;
+    }
+
+    case WM_APP_FILEOP_DONE: {
+        FileOpTask* task = (FileOpTask*)w;
+        DWORD rc = (DWORD)l;
+
+        // Close thread handle
+        if (task && task->hThread) {
+            CloseHandle(task->hThread);
+            task->hThread = NULL;
+        }
+
+        const bool isPlaybackExitTask = (task && task->fromPlaybackExit);
+        const uint32_t gen = task ? task->playbackExitGen : 0;
+
+        // Auto-close the file-op log window on success
+        if (task && rc == 0) {
+            if (task->hwnd && IsWindow(task->hwnd)) {
+                DestroyWindow(task->hwnd);
+            }
+            task->hwnd = NULL;
+            task->hEdit = NULL;
+            task->hCancel = NULL;
+
+            // Remove + delete successful tasks so they don't pile up
+            EnterCriticalSection(&g_fileLock);
+            auto it = std::find(g_fileTasks.begin(), g_fileTasks.end(), task);
+            if (it != g_fileTasks.end()) g_fileTasks.erase(it);
+            LeaveCriticalSection(&g_fileLock);
+
+            delete task;
+            task = NULL;
+        }
+
+        // If this was part of the playback-exit batch, count it down
+        if (isPlaybackExitTask && gen != 0 && gen == g_pbExitBatchActive) {
+            if (g_pbExitPending > 0) --g_pbExitPending;
+
+            if (g_pbExitPending <= 0 && g_pbExitWantsReload) {
+                // Only reload if user is still on the same folder
+                if (!g_inPlayback &&
+                    g_view == ViewKind::Folder &&
+                    _wcsicmp(g_folder.c_str(), g_pbExitFolder.c_str()) == 0)
+                {
+                    StartBackgroundFolderReload(g_pbExitFolder);
+                }
+
+                // Clear batch state
+                g_pbExitWantsReload = false;
+                g_pbExitBatchActive = 0;
+                g_pbExitPending = 0;
+                g_pbExitFolder.clear();
+            }
+        }
+
+        // For playback-exit tasks, do NOT do expensive foreground refresh.
+        // For normal tasks, keep existing behavior.
+        if (!g_inPlayback && !isPlaybackExitTask) {
+            RefreshCurrentView();
+        }
+
+        return 0;
+    }
+
+    case WM_APP_FOLDER_RELOAD_DONE: {
+        FolderReloadResult* res = (FolderReloadResult*)l;
+        if (!res) return 0;
+
+        const uint32_t myGen = res->gen;
+        std::wstring folder = EnsureSlash(res->folder);
+
+        const bool accept =
+            (!g_inPlayback) &&
+            (myGen == g_folderReloadGen.load(std::memory_order_relaxed)) &&
+            (g_view == ViewKind::Folder) &&
+            (_wcsicmp(g_folder.c_str(), folder.c_str()) == 0);
+
+        if (accept && res->rows) {
+            CancelMetaWorkAndClearTodo();
+
+            g_rows.swap(*res->rows);
+
+            // If the user changed sort while reload was running, re-sort to current.
+            if (g_sortCol != res->sortCol || g_sortAsc != res->sortAsc) {
+                SortRowsVector(g_rows, g_sortCol, g_sortAsc);
+            }
+
+            SendMessageW(g_hwndList, WM_SETREDRAW, FALSE, 0);
+            LV_ResetColumns();
+            LV_Rebuild();
+            SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(g_hwndList, NULL, TRUE);
+
+            QueueMissingPropsAndKickWorker();
+            SetTitleFolderOrDrives();
+        }
+
+        if (res->rows) delete res->rows;
+        delete res;
+        return 0;
+    }
+
     case WM_APP_META: {
         MetaResult* r = (MetaResult*)l;
         if (r) {
@@ -3997,30 +4796,58 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_COMBINE_DONE: {
         CombineTask* task = (CombineTask*)w;
         DWORD exitCode = (DWORD)l;
-        UNREFERENCED_PARAMETER(exitCode);
 
+        const bool success = (exitCode == 0);
+
+        // Mark not running (and optionally remove on success)
         EnterCriticalSection(&g_combineLock);
-        for (CombineTask* t : g_combineTasks) {
-            if (t == task) {
-                t->running = false;
-                break;
+        auto it = std::find(g_combineTasks.begin(), g_combineTasks.end(), task);
+        if (it != g_combineTasks.end()) {
+            (*it)->running = false;
+            if (success) {
+                g_combineTasks.erase(it);
             }
         }
         LeaveCriticalSection(&g_combineLock);
 
+        // Close handles
         if (task) {
             if (task->hProcess) { CloseHandle(task->hProcess); task->hProcess = NULL; }
-            if (task->hThread) { CloseHandle(task->hThread); task->hThread = NULL; }
+            if (task->hThread) { CloseHandle(task->hThread);  task->hThread = NULL; }
         }
 
-        if (g_view == ViewKind::Folder) {
-            ShowFolder(g_folder);
+        if (task && success) {
+            // Auto-close the log window on success
+            if (task->hwnd && IsWindow(task->hwnd)) {
+                DestroyWindow(task->hwnd);   // NOTE: DestroyWindow (not WM_CLOSE) bypasses your SW_HIDE behavior
+            }
+            task->hwnd = NULL;
+            task->hEdit = NULL;
+
+            delete task;
+            task = NULL;
         }
-        else if (g_view == ViewKind::Search && g_search.active) {
-            std::vector<Row> res;
-            RunSearchFromOrigin(res);
-            ShowSearchResults(res);
+        else if (task && !success) {
+            // On failure, keep the window so the user can read the log.
+            if (task->hwnd && IsWindow(task->hwnd)) {
+                ShowWindow(task->hwnd, SW_SHOWNOACTIVATE);
+                SetWindowPos(task->hwnd, HWND_TOP, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
         }
+
+        // Refresh only when NOT in playback (prevents messing with playback UI)
+        if (!g_inPlayback) {
+            if (g_view == ViewKind::Folder) {
+                ShowFolder(g_folder);
+            }
+            else if (g_view == ViewKind::Search && g_search.active) {
+                std::vector<Row> res;
+                RunSearchFromOrigin(res);
+                ShowSearchResults(res);
+            }
+        }
+
         return 0;
     }
 
@@ -4030,9 +4857,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             MessageBoxW(h, L"Loading folder... please wait.", L"Media Explorer", MB_OK);
             return 0;
         }
-        if (HasRunningCombineTasks() || HasRunningFfmpegTasks()) {
+        if (HasRunningCombineTasks() || HasRunningFfmpegTasks() || HasRunningFileOpTasks()) {
             MessageBoxW(h,
-                L"Background video operations are still running.\n"
+                L"Background operations are still running.\n"
                 L"Please wait for them to finish before exiting Media Explorer.",
                 L"Background tasks in progress",
                 MB_OK);
@@ -4042,8 +4869,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_DESTROY:
+        CancelBackgroundFolderReload(); // NEW: ignore any pending reload results
+
         KillTimer(h, kTimerPlaybackUI);
 
+        // stop meta work
         CancelMetaWorkAndClearTodo();
         if (g_metaThread) {
             WaitForSingleObject(g_metaThread, 200);
@@ -4051,31 +4881,56 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_metaThread = NULL;
         }
 
-        DeleteCriticalSection(&g_metaLock);
-        DeleteCriticalSection(&g_combineLock);
-        DeleteCriticalSection(&g_ffLock);       // NEW
+        // ---- Cleanup FileOp tasks
+        EnterCriticalSection(&g_fileLock);
+        for (FileOpTask* t : g_fileTasks) {
+            if (!t) continue;
+            if (t->hThread) { CloseHandle(t->hThread); t->hThread = NULL; }
+            if (t->hwnd && IsWindow(t->hwnd)) DestroyWindow(t->hwnd);
+            delete t;
+        }
+        g_fileTasks.clear();
+        LeaveCriticalSection(&g_fileLock);
 
-        // Cleanup any remaining FFmpeg tasks (should be none because ExitPlayback waits,
-        // but this is a safety net)
+        // ---- Cleanup FFmpeg tasks (safety net)
         EnterCriticalSection(&g_ffLock);
         for (FfmpegTask* t : g_ffTasks) {
             if (!t) continue;
-            if (t->hProcess) CloseHandle(t->hProcess);
-            if (t->hThread)  CloseHandle(t->hThread);
+            if (t->hProcess) { CloseHandle(t->hProcess); t->hProcess = NULL; }
+            if (t->hThread) { CloseHandle(t->hThread);  t->hThread = NULL; }
             if (t->hwnd && IsWindow(t->hwnd)) DestroyWindow(t->hwnd);
             delete t;
         }
         g_ffTasks.clear();
         LeaveCriticalSection(&g_ffLock);
 
+        // ---- Cleanup Combine tasks (optional safety net)
+        EnterCriticalSection(&g_combineLock);
+        for (CombineTask* t : g_combineTasks) {
+            if (!t) continue;
+            if (t->hProcess) { CloseHandle(t->hProcess); t->hProcess = NULL; }
+            if (t->hThread) { CloseHandle(t->hThread);  t->hThread = NULL; }
+            if (t->hwnd && IsWindow(t->hwnd)) DestroyWindow(t->hwnd);
+            delete t;
+        }
+        g_combineTasks.clear();
+        LeaveCriticalSection(&g_combineLock);
+
+        // ---- Delete critical sections AFTER all use
+        DeleteCriticalSection(&g_metaLock);
+        DeleteCriticalSection(&g_combineLock);
+        DeleteCriticalSection(&g_ffLock);
+        DeleteCriticalSection(&g_fileLock);
 
         if (g_mp) { libvlc_media_player_stop(g_mp); libvlc_media_player_release(g_mp); g_mp = NULL; }
         if (g_vlc) { libvlc_release(g_vlc); g_vlc = NULL; }
+
         PostQuitMessage(0);
         return 0;
-    }
+    } // end switch (m)
+
     return DefWindowProcW(h, m, w, l);
-}
+} // end WndProc
 
 // ----------------------------- Entry
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
