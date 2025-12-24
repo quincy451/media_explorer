@@ -52,6 +52,11 @@
 #include <shlobj.h>     // SHCreateDirectoryExW
 #include <cstdarg>
 #include <io.h> // for _unlink
+#include <unordered_map>
+#include <memory>
+#include <winnetwk.h>   // WNetGetConnectionW
+#include <winreg.h>     // registry (RemotePath fallback)
+
 
 
 #pragma comment(lib, "Comctl32.lib")
@@ -62,8 +67,13 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Propsys.lib")
 #pragma comment(lib, "Uuid.lib")
+#pragma comment(lib, "Mpr.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 #include <vlc/vlc.h>
+
+#define IDC_STATUSBAR  5001
+
 
 #ifndef FIND_FIRST_EX_LARGE_FETCH
 // Older SDKs may miss this flag; define to 0 (ignored) to stay compatible.
@@ -76,7 +86,11 @@ static void LogLine(const wchar_t* fmt, ...); // forward declaration
 
 // ----------------------------- Globals
 HINSTANCE g_hInst = NULL;
-HWND g_hwndMain = NULL, g_hwndList = NULL, g_hwndVideo = NULL, g_hwndSeek = NULL;
+HWND g_hwndMain = NULL;
+HWND g_hwndStatus = NULL;
+HWND g_hwndList = NULL;
+HWND g_hwndVideo = NULL;
+HWND g_hwndSeek = NULL;
 
 enum class ViewKind { Drives, Folder, Search };
 ViewKind g_view = ViewKind::Drives;
@@ -91,6 +105,8 @@ struct Row {
     // video props
     int          vW, vH;
     ULONGLONG    vDur100ns;
+    // NEW (Drives view): mapped drive UNC like \\server\share
+    std::wstring netRemote;
     Row() : isDir(false), size(0), vW(0), vH(0), vDur100ns(0) { modified.dwLowDateTime = modified.dwHighDateTime = 0; }
 };
 std::vector<Row> g_rows;
@@ -136,15 +152,63 @@ struct AppConfig {
     std::wstring upscaleDirectory;  // e.g. w:\upscale\autosubmit (may be empty)
     bool ffmpegAvailable = false;  // if true, ffmpeg-based tools are enabled & shown in help
     bool ffprobeAvailable = false;  // if true, ffprobe-based info is enabled & shown in help
-//    bool videoCombineAvailable = false;   // if true, Ctrl+Plus / video_combine.exe is enabled
+    std::wstring topazUpscaleQueue; // e.g. w:\topaz_queue (AIDev NVMe). Job submit writes <video.ext> + <video.json> here.
+    std::wstring ffmpegPath;        // optional full path to ffmpeg.exe (your system ffmpeg 8.x). If empty, uses "ffmpeg" from PATH.
+    std::wstring ffprobePath;       // optional full path to ffprobe.exe. If empty, uses "ffprobe" from PATH.
 
     bool        loggingEnabled = false; // master on/off
     std::wstring loggingPath;          // folder from INI
     std::wstring logFile;             // full path to mediaexplorer.log
+    std::wstring vlcHwAccel = L"d3d11va";
 };
 
 AppConfig g_cfg;
 
+
+// Optional override executables (derived from config)
+static std::string g_vlcHwArgA = "--avcodec-hw=d3d11va";
+static std::wstring g_ffmpegExeW = L"ffmpeg";
+static std::wstring g_ffprobeExeW = L"ffprobe";
+static std::string  g_ffmpegExeA = "ffmpeg";
+
+// Forward decl for ACP narrow helper (used by combine code)
+static std::string NarrowFromWideACP(const std::wstring & ws);
+// forward decls (used by Topaz submit helpers)
+static std::wstring EnsureSlash(std::wstring p);
+static std::string  ToUtf8(const std::wstring& ws);
+static void PumpMessagesThrottled(DWORD msInterval);
+static bool GetDriveRemoteUNC(wchar_t letter, std::wstring& outRemote);
+static bool GetPersistentMappedRemotePath(wchar_t letter, std::wstring& outRemote);
+
+
+
+
+static std::wstring QuoteArg(const std::wstring & s) {
+        // Simple Windows quoting (good enough for paths); we assume no embedded quotes in paths.
+        if (s.empty()) return L"\"\"";
+    if (s.find_first_of(L" \t") == std::wstring::npos) return s;
+    return L"\"" + s + L"\"";
+    
+}
+
+static bool DirExistsW(const std::wstring & p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return (a != INVALID_FILE_ATTRIBUTES) && (a & FILE_ATTRIBUTE_DIRECTORY);
+    
+}
+
+static bool CanWriteToDir(const std::wstring & dir) {
+    if (!DirExistsW(dir)) return false;
+    std::wstring test = EnsureSlash(dir) + L"__write_test.tmp";
+    HANDLE h = CreateFileW(test.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD n = 0;
+    WriteFile(h, "x", 1, &n, NULL);
+    CloseHandle(h);
+    return true;
+    
+}
 
 
 // fullscreen (app-managed)
@@ -195,8 +259,133 @@ constexpr UINT WM_APP_FILEOP_OUTPUT = WM_APP + 400;
 constexpr UINT WM_APP_FILEOP_DONE = WM_APP + 401;
 // NEW: background folder reload finished
 constexpr UINT WM_APP_FOLDER_RELOAD_DONE = WM_APP + 450;
+static const UINT WMU_STATUS_OP = WM_APP + 250;
 
-enum class FileOpKind { ClipboardPaste, DeleteFiles, CopyToPath };
+enum class StatusOpAction : UINT_PTR { Begin = 1, Update = 2, End = 3 };
+
+struct StatusOpMsg
+{
+    StatusOpAction action;
+    uint64_t       id;
+    std::wstring   text;  // used for Begin/Update
+};
+
+static std::atomic<uint64_t> g_nextStatusOpId{ 1 };
+
+// ----------------------------- Status line operation tracker (RESTORED)
+
+class StatusOpTracker
+{
+public:
+    uint64_t begin(uint64_t id, std::wstring text)
+    {
+        m_text[id] = std::move(text);
+        m_stack.push_back(id);
+        cleanup();
+        return id;
+    }
+
+    void update(uint64_t id, std::wstring text)
+    {
+        auto it = m_text.find(id);
+        if (it != m_text.end())
+            it->second = std::move(text);
+        cleanup();
+    }
+
+    void end(uint64_t id)
+    {
+        m_text.erase(id);
+        auto it = std::find(m_stack.begin(), m_stack.end(), id);
+        if (it != m_stack.end())
+            m_stack.erase(it);
+        cleanup();
+    }
+
+    std::wstring buildDisplayText() const
+    {
+        if (m_stack.empty()) return L"";
+        uint64_t top = m_stack.back();
+        auto it = m_text.find(top);
+        if (it == m_text.end()) return L"";
+
+        if (m_text.size() > 1)
+            return it->second + L"   (" + std::to_wstring(m_text.size()) + L" running)";
+        return it->second;
+    }
+
+private:
+    void cleanup()
+    {
+        while (!m_stack.empty() && m_text.find(m_stack.back()) == m_text.end())
+            m_stack.pop_back();
+    }
+
+    std::unordered_map<uint64_t, std::wstring> m_text;
+    std::vector<uint64_t> m_stack;
+};
+
+static StatusOpTracker g_statusOps;
+static std::wstring    g_lastStatusLine;
+
+static void RefreshStatusBar()
+{
+    if (!g_hwndStatus) return;
+
+    std::wstring line = g_statusOps.buildDisplayText();
+    if (line == g_lastStatusLine) return;
+    g_lastStatusLine = line;
+
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)g_lastStatusLine.c_str());
+}
+
+static void PostStatusMsg(StatusOpMsg* msg)
+{
+    HWND hwnd = g_hwndMain;
+    if (!IsWindow(hwnd)) { delete msg; return; }
+    if (!PostMessageW(hwnd, WMU_STATUS_OP, 0, (LPARAM)msg))
+        delete msg;
+}
+
+static uint64_t StatusOpBegin(const std::wstring& text)
+{
+    uint64_t id = g_nextStatusOpId.fetch_add(1);
+    PostStatusMsg(new StatusOpMsg{ StatusOpAction::Begin, id, text });
+    return id;
+}
+
+static void StatusOpUpdate(uint64_t id, const std::wstring& text)
+{
+    PostStatusMsg(new StatusOpMsg{ StatusOpAction::Update, id, text });
+}
+
+static void StatusOpEnd(uint64_t id)
+{
+    PostStatusMsg(new StatusOpMsg{ StatusOpAction::End, id, L"" });
+}
+
+enum class FileOpKind { ClipboardPaste, DeleteFiles, CopyToPath, TopazSubmit};
+
+enum class TopazTarget { K4, K8 };
+enum class TopazProfile {
+    General,
+    Repair,
+    Stabilize,
+    Deblur,
+    Denoise,
+    DeinterlaceRepair,
+    Repair2Pass,
+    GeneralGrain,
+    RepairGrain
+    
+};
+struct TopazJobOptions {
+    TopazTarget  target = TopazTarget::K4;
+    TopazProfile profile = TopazProfile::General;
+    double       grain = 0.0;  // 0 = off
+    int          gsize = 1;
+    
+};
 
 struct FileOpTask {
     HANDLE hThread = NULL;
@@ -219,6 +408,9 @@ struct FileOpTask {
     std::wstring srcSingle;
     std::wstring dstPath;
 
+     // TopazSubmit (batch)
+     TopazJobOptions topaz;
+
     std::wstring title;
     std::atomic<bool> cancel{ false };
     bool running = false;
@@ -226,6 +418,88 @@ struct FileOpTask {
     DWORD exitCode = 0;
     bool hiddenByPlayback = false;
 };
+
+static std::string JsonEscapeUtf8(const std::string & s) {
+    std::string o; o.reserve(s.size() + 16);
+    for (char c : s) {
+        switch (c) {
+        case '\\': o += "\\\\"; break;
+        case '\"': o += "\\\""; break;
+        case '\r': o += "\\r"; break;
+        case '\n': o += "\\n"; break;
+        case '\t': o += "\\t"; break;
+        default: o.push_back(c); break;
+                
+        }
+        
+    }
+    return o;
+    
+}
+
+static std::string NowUtcIso8601() {
+    SYSTEMTIME st{}; GetSystemTime(&st);
+    char buf[64];
+    sprintf_s(buf, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return std::string(buf);
+    
+}
+
+static void BuildTopazJobJsonUtf8(const std::wstring & originalFull,
+    const std::wstring & queuedFileNameOnly,
+    const TopazJobOptions & opt,
+    std::string & outUtf8)
+     {
+    const int w = (opt.target == TopazTarget::K8) ? 7680 : 3840;
+    const int h = (opt.target == TopazTarget::K8) ? 4320 : 2160;
+    
+        auto profileName = [&]() -> const char* {
+        switch (opt.profile) {
+        case TopazProfile::General: return "general";
+        case TopazProfile::Repair: return "repair";
+        case TopazProfile::Stabilize: return "stabilize";
+        case TopazProfile::Deblur: return "deblur";
+        case TopazProfile::Denoise: return "denoise";
+        case TopazProfile::DeinterlaceRepair: return "deinterlace_repair";
+        case TopazProfile::Repair2Pass: return "repair_2pass";
+        case TopazProfile::GeneralGrain: return "general_grain";
+        case TopazProfile::RepairGrain: return "repair_grain";
+        default: return "general";
+                
+        }
+     };
+    
+     std::string orig = JsonEscapeUtf8(ToUtf8(originalFull));
+     std::string inFile = JsonEscapeUtf8(ToUtf8(queuedFileNameOnly));
+    
+     char wh[64]; sprintf_s(wh, "%d", w);
+     char hh[64]; sprintf_s(hh, "%d", h);
+    
+     char grainBuf[64]; sprintf_s(grainBuf, "%.6f", opt.grain);
+     char gsizeBuf[32]; sprintf_s(gsizeBuf, "%d", opt.gsize);
+    
+     std::string t = (opt.target == TopazTarget::K8) ? "8k" : "4k";
+     std::string utc = NowUtcIso8601();
+    
+     std::ostringstream oss;
+     oss
+         << "{\n"
+         << "  \"job_version\": 1,\n"
+         << "  \"submitted_utc\": \"" << utc << "\",\n"
+         << "  \"source_original\": \"" << orig << "\",\n"
+         << "  \"input_file\": \"" << inFile << "\",\n"
+         << "  \"target\": \"" << t << "\",\n"
+         << "  \"target_w\": " << wh << ",\n"
+         << "  \"target_h\": " << hh << ",\n"
+         << "  \"profile\": \"" << profileName() << "\",\n"
+         << "  \"grain\": " << grainBuf << ",\n"
+         << "  \"gsize\": " << gsizeBuf << "\n"
+         << "}\n";
+    
+     outUtf8 = oss.str();
+}
+
 
 CRITICAL_SECTION g_fileLock;
 std::vector<FileOpTask*> g_fileTasks;
@@ -352,6 +626,19 @@ static bool HasRunningFfmpegTasks() {
     LeaveCriticalSection(&g_ffLock);
     return any;
 }
+
+static void ForceMaximizeForPlayback()
+{
+    if (!g_hwndMain || !IsWindow(g_hwndMain)) return;
+    if (IsZoomed(g_hwndMain)) return; // already maximized
+
+    ShowWindow(g_hwndMain, SW_MAXIMIZE);
+    UpdateWindow(g_hwndMain);
+
+    // Ensure WM_SIZE etc. are processed before we compute playback layout
+    PumpMessagesThrottled(0);
+}
+
 
 // Hide all combine + ffmpeg log windows and remember which ones
 // were visible so we can restore them when leaving fullscreen.
@@ -629,7 +916,7 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
     wchar_t secBuf[64];
     swprintf_s(secBuf, L"%.3f", seconds);
 
-    std::wstring cmd = L"ffmpeg -y ";
+    std::wstring cmd = QuoteArg(g_ffmpegExeW) + L" -y ";
     switch (task->kind) {
     case FfmpegOpKind::TrimFront:
         // Keep from refMs -> end
@@ -865,6 +1152,63 @@ static std::wstring Trim(const std::wstring& s) {
     return s.substr(start, end - start);
 }
 
+static bool GetDriveRemoteUNC(wchar_t letter, std::wstring& outRemote)
+{
+    outRemote.clear();
+
+    wchar_t local[3] = { (wchar_t)towupper(letter), L':', 0 };
+
+    wchar_t buf[1024];
+    DWORD sz = (DWORD)_countof(buf);
+    DWORD rc = WNetGetConnectionW(local, buf, &sz);
+    if (rc == NO_ERROR)
+    {
+        outRemote = buf;
+        return !outRemote.empty();
+    }
+    return false;
+}
+
+static bool RegReadStringValue(HKEY hKey, const wchar_t* valueName, std::wstring& out)
+{
+    out.clear();
+    DWORD type = 0, cb = 0;
+
+    if (RegQueryValueExW(hKey, valueName, NULL, &type, NULL, &cb) != ERROR_SUCCESS)
+        return false;
+    if (type != REG_SZ && type != REG_EXPAND_SZ)
+        return false;
+    if (cb < sizeof(wchar_t))
+        return false;
+
+    std::vector<wchar_t> buf(cb / sizeof(wchar_t) + 2, L'\0');
+    if (RegQueryValueExW(hKey, valueName, NULL, &type, (LPBYTE)buf.data(), &cb) != ERROR_SUCCESS)
+        return false;
+
+    buf.back() = L'\0';
+    out = Trim(buf.data());
+    return !out.empty();
+}
+
+// HKCU\Network\<Letter>\RemotePath
+static bool GetPersistentMappedRemotePath(wchar_t letter, std::wstring& outRemote)
+{
+    outRemote.clear();
+    letter = (wchar_t)towupper(letter);
+
+    wchar_t subkey[64];
+    swprintf_s(subkey, L"Network\\%c", letter);
+
+    HKEY h = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &h) != ERROR_SUCCESS)
+        return false;
+
+    bool ok = RegReadStringValue(h, L"RemotePath", outRemote);
+    RegCloseKey(h);
+    return ok;
+}
+
+
 // ----------------------------- Logging helpers
 
 static void InitLoggingFromConfig() {
@@ -1088,8 +1432,7 @@ static bool GetMediaInfoFromFfprobe(const std::wstring& path,
     //   width=576
     //   height=768
     //
-    std::wstring cmdV =
-        L"ffprobe -v error "
+    std::wstring cmdV = QuoteArg(g_ffprobeExeW) + L" -v error "
         L"-select_streams v:0 "
         L"-show_entries stream=codec_name,width,height "
         L"-of default=noprint_wrappers=1 \"";
@@ -1145,8 +1488,7 @@ static bool GetMediaInfoFromFfprobe(const std::wstring& path,
     // Example line:
     //   codec_name=aac
     //
-    std::wstring cmdA =
-        L"ffprobe -v error "
+    std::wstring cmdA = QuoteArg(g_ffprobeExeW) + L" -v error "
         L"-select_streams a:0 "
         L"-show_entries stream=codec_name "
         L"-of default=noprint_wrappers=1 \"";
@@ -1305,6 +1647,27 @@ static void LoadConfigFromIni() {
                 g_cfg.upscaleDirectory = EnsureSlash(g_cfg.upscaleDirectory);
             }
         }
+        else if (key == L"topazupscalequeue") {
+            g_cfg.topazUpscaleQueue = val;
+            if (!g_cfg.topazUpscaleQueue.empty()) {
+                g_cfg.topazUpscaleQueue = EnsureSlash(g_cfg.topazUpscaleQueue);
+                
+            }
+            
+        }
+        else if (key == L"ffmpeg_path" || key == L"ffmpegpath") {
+            g_cfg.ffmpegPath = val;
+            
+        }
+        else if (key == L"ffprobe_path" || key == L"ffprobepath") {
+            g_cfg.ffprobePath = val;
+            
+        }
+
+        else if (key == L"vlc_hwaccel" || key == L"vlchwaccel" || key == L"vlc_hw" || key == L"avcodec_hw") {
+            g_cfg.vlcHwAccel = val;
+        }
+
         else if (key == L"ffmpegavailable") {
             std::wstring v = ToLower(val);
             g_cfg.ffmpegAvailable =
@@ -1326,14 +1689,43 @@ static void LoadConfigFromIni() {
     }
     // after the while(...) loop
     InitLoggingFromConfig();
-    if (g_cfg.loggingEnabled) 
+    // derive executable overrides
+    g_ffmpegExeW = g_cfg.ffmpegPath.empty() ? L"ffmpeg" : g_cfg.ffmpegPath;
+    g_ffprobeExeW = g_cfg.ffprobePath.empty() ? L"ffprobe" : g_cfg.ffprobePath;
+    g_ffmpegExeA = g_cfg.ffmpegPath.empty() ? "ffmpeg" : NarrowFromWideACP(g_cfg.ffmpegPath);
+    
+    if (g_cfg.loggingEnabled)
     {
         LogLine(L"Config: upscale=\"%s\" ffmpeg=%d ffprobe=%d loggingPath=\"%s\"",
             g_cfg.upscaleDirectory.c_str(),
             g_cfg.ffmpegAvailable ? 1 : 0,
             g_cfg.ffprobeAvailable ? 1 : 0,
             g_cfg.loggingPath.c_str());
+        LogLine(L"Config: topazQueue=\"%s\" ffmpeg_path=\"%s\" ffprobe_path=\"%s\"",
+            g_cfg.topazUpscaleQueue.c_str(),
+            g_cfg.ffmpegPath.c_str(),
+            g_cfg.ffprobePath.c_str());
+        LogLine(L"Config: vlc_hwaccel=\"%s\"", g_cfg.vlcHwAccel.c_str());
+
     }
+    // Derive libVLC hardware-decoding arg from config.
+    // Accepts: d3d11va | dxva2 | any | none
+    // Also accepts bool-ish values: 0/1, off/on, false/true.
+    {
+        std::wstring hw = ToLower(Trim(g_cfg.vlcHwAccel));
+        if (hw.empty()) hw = L"d3d11va";
+
+        if (hw == L"0" || hw == L"false" || hw == L"off" || hw == L"no" || hw == L"disable" || hw == L"disabled")
+            hw = L"none";
+        else if (hw == L"1" || hw == L"true" || hw == L"on" || hw == L"yes" || hw == L"default")
+            hw = L"d3d11va";
+        else if (hw == L"auto")
+            hw = L"any";
+
+        g_cfg.vlcHwAccel = hw; // keep normalized for logging/help
+        g_vlcHwArgA = std::string("--avcodec-hw=") + ToUtf8(hw);
+    }
+
 }
 
 
@@ -1355,8 +1747,13 @@ static void ShowHelp() {
 
     msg += L"CONFIGURATION (mediaexplorer.ini)\n"
         L"  upscaledirectory = w:\\upscale\\autosubmit\n"
+        L"  topazUpscaleQueue = w:\\topaz_queue\\pending   (AIDev queue; Ctrl+U submits jobs)\n"
+        L"  ffmpeg_path       = C:\\ffmpeg\\bin\\ffmpeg.exe (optional; else uses PATH)\n"
+        L"  ffprobe_path      = C:\\ffmpeg\\bin\\ffprobe.exe (optional; else uses PATH)\n"
         L"  ffmpegAvailable  = 0|1  (enable FFmpeg tools: trim / flip)\n"
         L"  ffprobeAvailable = 0|1  (enable ffprobe-based details)\n\n";
+    msg += L"  vlc_hwaccel      = d3d11va|dxva2|any|none (default d3d11va; set none to disable HW decode)\n";
+
 
     msg += L"FILE BROWSER (list)\n"
         L"  Enter / Double-click : Open folder / Play selected video(s)\n"
@@ -1365,7 +1762,8 @@ static void ShowHelp() {
         L"  Ctrl+A               : Select all videos in current view\n"
         L"  Ctrl+P               : Play selected videos\n"
         L"  Ctrl+F               : Search (recursive). In Search view: refine (AND/intersection)\n"
-        L"  Ctrl+Up/Down         : Move selected row up/down (single selection)\n";
+        L"  Ctrl+Up/Down         : Move selected row up/down (single selection)\n"
+        L"  Ctrl+U               : Submit selected videos to Topaz queue (writes .json jobs (no tracking))\n";
 
     if (g_cfg.ffmpegAvailable) {
         msg += L"  Ctrl+Plus            : Combine selected files into one video (background)\n";
@@ -1419,12 +1817,30 @@ static void ShowHelp() {
 }
 
 // ----------------------------- ListView helpers
-static void LV_ResetColumns() {
+static void LV_ResetColumns()
+{
     ListView_DeleteAllItems(g_hwndList);
     while (ListView_DeleteColumn(g_hwndList, 0)) {}
-    LVCOLUMNW c; ZeroMemory(&c, sizeof(c));
+
+    LVCOLUMNW c{};
     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
+    // Drives view: Remote + Drive
+    if (g_view == ViewKind::Drives)
+    {
+        c.pszText = const_cast<wchar_t*>(L"Remote");
+        c.cx = 620;
+        c.iSubItem = 0;
+        ListView_InsertColumn(g_hwndList, 0, &c);
+
+        c.pszText = const_cast<wchar_t*>(L"Drive");
+        c.cx = 160;
+        c.iSubItem = 1;
+        ListView_InsertColumn(g_hwndList, 1, &c);
+        return;
+    }
+
+    // Folder/Search view: original columns
     c.pszText = const_cast<wchar_t*>(L"Name");       c.cx = 740; c.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &c);
     c.pszText = const_cast<wchar_t*>(L"Type");       c.cx = 80;  c.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &c);
     c.pszText = const_cast<wchar_t*>(L"Size");       c.cx = 120; c.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &c);
@@ -1432,7 +1848,25 @@ static void LV_ResetColumns() {
     c.pszText = const_cast<wchar_t*>(L"Resolution"); c.cx = 140; c.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &c);
     c.pszText = const_cast<wchar_t*>(L"Duration");   c.cx = 140; c.iSubItem = 5; ListView_InsertColumn(g_hwndList, 5, &c);
 }
-static void LV_Add(int rowIndex, const Row& r) {
+static void LV_Add(int rowIndex, const Row& r)
+{
+    // Drives view: col0=Remote, col1=Drive
+    if (g_view == ViewKind::Drives)
+    {
+        LVITEMW it{};
+        it.mask = LVIF_TEXT | LVIF_PARAM;
+        it.iItem = rowIndex;
+        it.lParam = rowIndex;
+
+        const wchar_t* remoteText = r.netRemote.empty() ? L"" : r.netRemote.c_str();
+        it.pszText = const_cast<wchar_t*>(remoteText);
+
+        ListView_InsertItem(g_hwndList, &it);
+        ListView_SetItemText(g_hwndList, rowIndex, 1, const_cast<wchar_t*>(r.name.c_str()));
+        return;
+    }
+
+    // ---- Folder/Search view: your existing code below ----
     LVITEMW it; ZeroMemory(&it, sizeof(it));
     it.mask = LVIF_TEXT | LVIF_PARAM; it.iItem = rowIndex;
     it.pszText = const_cast<wchar_t*>(r.name.c_str()); it.lParam = rowIndex;
@@ -1766,11 +2200,30 @@ static void ShowDrives() {
     DWORD mask = GetLogicalDrives();
     for (int i = 0; i < 26; ++i) {
         if (!(mask & (1u << i))) continue;
-        wchar_t root[4] = { wchar_t(L'A' + i), L':', L'\\', 0 };
-        Row r; r.name = root; r.full = root; r.isDir = true;
-        g_rows.push_back(r);
+
+        wchar_t letter = (wchar_t)(L'A' + i);
+        wchar_t root[4] = { letter, L':', L'\\', 0 };
+
+        // OPTIONAL: hide optical drives (CD/DVD/BD)
+        if (GetDriveTypeW(root) == DRIVE_CDROM)
+            continue;
+
+        Row r;
+        r.name = root;
+        r.full = root;
+        r.isDir = true;
+
+        // Fill Remote column for mapped drives
+        std::wstring remote;
+        if (GetDriveRemoteUNC(letter, remote) || GetPersistentMappedRemotePath(letter, remote))
+            r.netRemote = remote;
+
+        g_rows.push_back(std::move(r));
     }
+
+    // Keep the old behavior: alphabetical by drive
     SortRows(0, true);
+
     SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_hwndList, NULL, TRUE);
 
@@ -2898,7 +3351,7 @@ static void ApplyPostActionsAndRefresh(bool hadFfmpegTasks) {
 
 static void PlayIndex(size_t idx) {
     if (!g_vlc) {
-        const char* args[] = { "--avcodec-hw=d3d11va", "--no-video-title-show" };
+        const char* args[] = { g_vlcHwArgA.c_str(), "--no-video-title-show" };
         g_vlc = libvlc_new((int)(sizeof(args) / sizeof(args[0])), args);
         g_mp = libvlc_media_player_new(g_vlc);
         libvlc_media_player_set_hwnd(g_mp, g_hwndVideo);
@@ -3121,6 +3574,8 @@ static void PlaySelectedVideos() {
         }
     }
     if (g_playlist.empty()) return;
+
+    ForceMaximizeForPlayback();
 
     g_inPlayback = true;
     ShowWindow(g_hwndList, SW_HIDE);
@@ -3560,6 +4015,114 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
             }
         }
     }
+    else if (task->kind == FileOpKind::TopazSubmit) {
+         // Copy each selected source video to the Topaz queue directory and write <base>._json then rename to <base>.json
+         const size_t total = task->srcFiles.size();
+         if (task->dstFolder.empty()) {
+             PostFileOpOutput(task, L"ERROR: Topaz queue directory not set.\r\n");
+             rc = 2;
+            
+         }
+         else {
+             for (size_t i = 0; i < total; ++i) {
+                 if (task->cancel.load(std::memory_order_relaxed)) { rc = ERROR_CANCELLED; break; }
+                 
+                 const std::wstring & src = task->srcFiles[i];
+                 const wchar_t* base = wcsrchr(src.c_str(), L'\\'); base = base ? base + 1 : src.c_str();
+                
+                 wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
+                 _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+                 
+                 // Pick a unique destination video name in queue
+                 std::wstring dstVideo = UniqueName(task->dstFolder, fname, ext);
+                
+                 // Derive json path from the chosen dstVideo base name
+                 const wchar_t* dstBase = wcsrchr(dstVideo.c_str(), L'\\');
+                 dstBase = dstBase ? dstBase + 1 : dstVideo.c_str();
+                
+                 wchar_t dstF[_MAX_FNAME] = {}, dstE[_MAX_EXT] = {};
+                 _wsplitpath_s(dstBase, NULL, 0, NULL, 0, dstF, _MAX_FNAME, dstE, _MAX_EXT);
+                
+                 std::wstring jsonFinal = task->dstFolder + dstF + L".json";
+                 std::wstring jsonTemp = task->dstFolder + dstF + L"._json";
+                
+                 // If json already exists (rare), force a different name by appending (N)
+                 int bump = 1;
+                 while (PathFileExistsW(jsonFinal.c_str()) || PathFileExistsW(jsonTemp.c_str())) {
+                    wchar_t suf[32]; swprintf_s(suf, L" (%d)", bump++);
+                    std::wstring newBase = std::wstring(dstF) + suf;
+                    dstVideo = task->dstFolder + newBase + dstE;
+                    jsonFinal = task->dstFolder + newBase + L".json";
+                    jsonTemp = task->dstFolder + newBase + L"._json";
+                    
+                 }
+                
+                 // Header
+                 {
+                     wchar_t hdr[256];
+                     swprintf_s(hdr, L"Topaz submit %zu of %zu:\r\n", i + 1, total);
+                     PostFileOpOutput(task, hdr);
+                     PostFileOpOutput(task, L"  From: " + src + L"\r\n");
+                     PostFileOpOutput(task, L"  To  : " + dstVideo + L"\r\n");
+                 }
+                
+                     // Copy file (cancelable)
+                 BOOL cancelFlag = FALSE;
+                 BOOL ok = CopyFileExW(src.c_str(), dstVideo.c_str(),
+                 FileOpCopyProgressThunk, task, &cancelFlag, 0);
+                
+                 if (!ok) {
+                    DWORD err = GetLastError();
+                    if (cancelFlag || task->cancel.load()) rc = ERROR_CANCELLED;
+                    else rc = err ? err : 1;
+                    wchar_t buf[256];
+                    swprintf_s(buf, L"ERROR: copy failed (err=%lu)\r\n\r\n", (unsigned long)rc);
+                    PostFileOpOutput(task, buf);
+                    break;
+                    
+                 }
+                
+                 // Write JSON temp then rename to .json (atomic publish)
+                 {
+                     const wchar_t* q = wcsrchr(dstVideo.c_str(), L'\\');
+                     std::wstring queuedNameOnly = q ? (q + 1) : dstVideo;
+
+                    std::string jsonUtf8;
+                    BuildTopazJobJsonUtf8(src, queuedNameOnly, task->topaz, jsonUtf8);
+                    
+                    HANDLE h = CreateFileW(jsonTemp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (h == INVALID_HANDLE_VALUE) {
+                        rc = GetLastError() ? GetLastError() : 5;
+                        PostFileOpOutput(task, L"ERROR: failed to create job ._json file.\r\n\r\n");
+                        break;
+                        
+                    }
+                    DWORD wrote = 0;
+                    BOOL wok = WriteFile(h, jsonUtf8.data(), (DWORD)jsonUtf8.size(), &wrote, NULL);
+                    CloseHandle(h);
+                    if (!wok || wrote != (DWORD)jsonUtf8.size()) {
+                        rc = GetLastError() ? GetLastError() : 6;
+                        PostFileOpOutput(task, L"ERROR: failed to write job ._json file.\r\n\r\n");
+                        break;
+                        
+                    }
+                    if (!MoveFileExW(jsonTemp.c_str(), jsonFinal.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+                        rc = GetLastError() ? GetLastError() : 7;
+                        PostFileOpOutput(task, L"ERROR: failed to publish job json (rename).\r\n\r\n");
+                        break;
+                        
+                    }
+                 }
+                
+                    PostFileOpOutput(task, L"OK (queued)\r\n\r\n");
+                
+            }
+            
+        }
+        
+    }
+
 
     if (rc == ERROR_CANCELLED) {
         PostFileOpOutput(task, L"\r\n[CANCELLED]\r\n");
@@ -3811,8 +4374,8 @@ static bool convert2mpg(const std::vector<std::string>& srcfn,
         mpgfn.push_back(mpgfile);
 
         // ffmpeg -i "src" -qscale:v 1 "dst.mpg"
-        sprintf(cmd, "ffmpeg -i \"%s\" -qscale:v 1 \"%s\"",
-            srcfn[index].c_str(), mpgfile);
+        sprintf(cmd, "%s -i \"%s\" -qscale:v 1 \"%s\"",
+            g_ffmpegExeA.c_str(), srcfn[index].c_str(), mpgfile);
         VC_LogCmd(task, cmd);
 
         DWORD exitCode = RunHiddenCommandAnsi(cmd);
@@ -3881,8 +4444,8 @@ static bool convertback(const std::string& combinefile,
     bool retval = true;
 
     // ffmpeg -i "combined.mpg" -qscale:v 2 "final.ext"
-    sprintf(cmd, "ffmpeg -i \"%s\" -qscale:v 2 \"%s\"",
-        combinefile.c_str(), finalfile.c_str());
+    sprintf(cmd, "%s -i \"%s\" -qscale:v 2 \"%s\"",
+        g_ffmpegExeA.c_str(), combinefile.c_str(), finalfile.c_str());
     VC_LogCmd(task, cmd);
 
     DWORD exitCode = RunHiddenCommandAnsi(cmd);
@@ -4103,10 +4666,359 @@ static DWORD WINAPI CombineThreadProc(LPVOID param) {
     return 0;
 }
 
+
+// ----------------------------- Topaz Ctrl+U submit helpers (LIST view)
+
+static bool PromptTopazTargetModal(TopazTarget& outTarget)
+{
+    struct Ctx { bool ok = false; TopazTarget t = TopazTarget::K4; };
+
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc{}; wc.hInstance = g_hInst;
+        wc.lpszClassName = L"TopazTargetClass";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpfnWndProc = [](HWND hh, UINT mm, WPARAM ww, LPARAM ll) -> LRESULT {
+            Ctx* c = (Ctx*)GetWindowLongPtrW(hh, GWLP_USERDATA);
+            switch (mm) {
+            case WM_CREATE: {
+                auto pcs = (LPCREATESTRUCT)ll;
+                c = (Ctx*)pcs->lpCreateParams;
+                SetWindowLongPtrW(hh, GWLP_USERDATA, (LONG_PTR)c);
+
+                HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                RECT rc; GetClientRect(hh, &rc);
+                int margin = DpiScale(12);
+                int btnW = DpiScale(220), btnH = DpiScale(30);
+                int y = margin;
+
+                HWND lbl = CreateWindowExW(0, L"STATIC", L"Topaz Upscale target:",
+                    WS_CHILD | WS_VISIBLE, margin, y, rc.right - 2 * margin, DpiScale(20),
+                    hh, NULL, g_hInst, NULL);
+                SendMessageW(lbl, WM_SETFONT, (WPARAM)hf, TRUE);
+                y += DpiScale(26);
+
+                HWND b4 = CreateWindowExW(0, L"BUTTON", L"4K (3840x2160)",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    margin, y, btnW, btnH, hh, (HMENU)9001, g_hInst, NULL);
+                SendMessageW(b4, WM_SETFONT, (WPARAM)hf, TRUE);
+                y += btnH + DpiScale(8);
+
+                HWND b8 = CreateWindowExW(0, L"BUTTON", L"8K (7680x4320)",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    margin, y, btnW, btnH, hh, (HMENU)9002, g_hInst, NULL);
+                SendMessageW(b8, WM_SETFONT, (WPARAM)hf, TRUE);
+                return 0;
+            }
+            case WM_COMMAND: {
+                int id = LOWORD(ww);
+                if (id == 9001 || id == 9002) {
+                    if (c) {
+                        c->ok = true;
+                        c->t = (id == 9002) ? TopazTarget::K8 : TopazTarget::K4;
+                    }
+                    DestroyWindow(hh);
+                    return 0;
+                }
+                break;
+            }
+            case WM_KEYDOWN:
+                if (ww == VK_ESCAPE) { DestroyWindow(hh); return 0; }
+                break;
+            case WM_CLOSE:
+                DestroyWindow(hh); return 0;
+            }
+            return DefWindowProcW(hh, mm, ww, ll);
+            };
+
+        RegisterClassW(&wc);
+        reg = true;
+    }
+
+    Ctx ctx;
+
+    MONITORINFO mi{ sizeof(mi) };
+    HMONITOR hm = MonitorFromWindow(g_hwndMain, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoW(hm, &mi);
+    RECT wa = mi.rcWork;
+
+    int W = DpiScale(360), H = DpiScale(190);
+    int X = wa.left + ((wa.right - wa.left) - W) / 2;
+    int Y = wa.top + ((wa.bottom - wa.top) - H) / 2;
+
+    HWND wnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"TopazTargetClass",
+        L"Topaz Upscale", WS_POPUPWINDOW | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        X, Y, W, H, g_hwndMain, NULL, g_hInst, &ctx);
+
+    SetForegroundWindow(wnd);
+
+    MSG msg;
+    while (IsWindow(wnd) && GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (!ctx.ok) return false;
+    outTarget = ctx.t;
+    return true;
+}
+
+static bool PromptTopazProfileModal(TopazProfile& outProfile, double& outGrain, int& outGsize)
+{
+    outProfile = TopazProfile::General;
+    outGrain = 0.0;
+    outGsize = 1;
+
+    struct Ctx { bool ok = false; int id = 0; };
+
+    static bool reg1 = false;
+    if (!reg1) {
+        WNDCLASSW wc{}; wc.hInstance = g_hInst;
+        wc.lpszClassName = L"TopazProfileClass";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpfnWndProc = [](HWND hh, UINT mm, WPARAM ww, LPARAM ll) -> LRESULT {
+            Ctx* c = (Ctx*)GetWindowLongPtrW(hh, GWLP_USERDATA);
+            switch (mm) {
+            case WM_CREATE: {
+                auto pcs = (LPCREATESTRUCT)ll;
+                c = (Ctx*)pcs->lpCreateParams;
+                SetWindowLongPtrW(hh, GWLP_USERDATA, (LONG_PTR)c);
+
+                HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                RECT rc; GetClientRect(hh, &rc);
+                int margin = DpiScale(12);
+                int btnW = DpiScale(360), btnH = DpiScale(28);
+                int y = margin;
+
+                HWND lbl = CreateWindowExW(0, L"STATIC", L"Topaz profile (Tier 1):",
+                    WS_CHILD | WS_VISIBLE, margin, y, rc.right - 2 * margin, DpiScale(20),
+                    hh, NULL, g_hInst, NULL);
+                SendMessageW(lbl, WM_SETFONT, (WPARAM)hf, TRUE);
+                y += DpiScale(26);
+
+                auto addBtn = [&](int id, const wchar_t* txt) {
+                    HWND b = CreateWindowExW(0, L"BUTTON", txt,
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_LEFT,
+                        margin, y, btnW, btnH, hh, (HMENU)(INT_PTR)id, g_hInst, NULL);
+                    SendMessageW(b, WM_SETFONT, (WPARAM)hf, TRUE);
+                    y += btnH + DpiScale(6);
+                    };
+
+                addBtn(9101, L"1) General upscale");
+                addBtn(9102, L"2) Repair (compression/noise/faces)");
+                addBtn(9103, L"3) Stabilize + upscale");
+                addBtn(9104, L"4) Motion Deblur + upscale");
+                addBtn(9105, L"5) Denoise-heavy + upscale");
+                addBtn(9199, L"More... (Deinterlace / 2-pass / Grain)");
+                return 0;
+            }
+            case WM_COMMAND: {
+                int id = LOWORD(ww);
+                if (id >= 9101 && id <= 9199) {
+                    if (c) { c->ok = true; c->id = id; }
+                    DestroyWindow(hh);
+                    return 0;
+                }
+                break;
+            }
+            case WM_KEYDOWN:
+                if (ww == VK_ESCAPE) { DestroyWindow(hh); return 0; }
+                break;
+            case WM_CLOSE:
+                DestroyWindow(hh); return 0;
+            }
+            return DefWindowProcW(hh, mm, ww, ll);
+            };
+        RegisterClassW(&wc);
+        reg1 = true;
+    }
+
+    auto runModal = [&](const wchar_t* cls, const wchar_t* title, int W, int H, void* ctx) -> bool {
+        MONITORINFO mi{ sizeof(mi) };
+        HMONITOR hm = MonitorFromWindow(g_hwndMain, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(hm, &mi);
+        RECT wa = mi.rcWork;
+
+        int X = wa.left + ((wa.right - wa.left) - W) / 2;
+        int Y = wa.top + ((wa.bottom - wa.top) - H) / 2;
+
+        HWND wnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, cls, title,
+            WS_POPUPWINDOW | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            X, Y, W, H, g_hwndMain, NULL, g_hInst, ctx);
+
+        SetForegroundWindow(wnd);
+
+        MSG msg;
+        while (IsWindow(wnd) && GetMessageW(&msg, NULL, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        return true;
+        };
+
+    Ctx c1;
+    runModal(L"TopazProfileClass", L"Topaz Upscale", DpiScale(420), DpiScale(330), &c1);
+    if (!c1.ok) return false;
+
+    if (c1.id == 9101) { outProfile = TopazProfile::General; return true; }
+    if (c1.id == 9102) { outProfile = TopazProfile::Repair;  return true; }
+    if (c1.id == 9103) { outProfile = TopazProfile::Stabilize; return true; }
+    if (c1.id == 9104) { outProfile = TopazProfile::Deblur;  return true; }
+    if (c1.id == 9105) { outProfile = TopazProfile::Denoise; return true; }
+
+    // Tier 2
+    struct Ctx2 { bool ok = false; int id = 0; };
+    static bool reg2 = false;
+    if (!reg2) {
+        WNDCLASSW wc{}; wc.hInstance = g_hInst;
+        wc.lpszClassName = L"TopazMoreClass";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpfnWndProc = [](HWND hh, UINT mm, WPARAM ww, LPARAM ll) -> LRESULT {
+            Ctx2* c = (Ctx2*)GetWindowLongPtrW(hh, GWLP_USERDATA);
+            switch (mm) {
+            case WM_CREATE: {
+                auto pcs = (LPCREATESTRUCT)ll;
+                c = (Ctx2*)pcs->lpCreateParams;
+                SetWindowLongPtrW(hh, GWLP_USERDATA, (LONG_PTR)c);
+
+                HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                RECT rc; GetClientRect(hh, &rc);
+                int margin = DpiScale(12);
+                int btnW = DpiScale(380), btnH = DpiScale(28);
+                int y = margin;
+
+                HWND lbl = CreateWindowExW(0, L"STATIC", L"Topaz profile (Tier 2):",
+                    WS_CHILD | WS_VISIBLE, margin, y, rc.right - 2 * margin, DpiScale(20),
+                    hh, NULL, g_hInst, NULL);
+                SendMessageW(lbl, WM_SETFONT, (WPARAM)hf, TRUE);
+                y += DpiScale(26);
+
+                auto addBtn = [&](int id, const wchar_t* txt) {
+                    HWND b = CreateWindowExW(0, L"BUTTON", txt,
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_LEFT,
+                        margin, y, btnW, btnH, hh, (HMENU)(INT_PTR)id, g_hInst, NULL);
+                    SendMessageW(b, WM_SETFONT, (WPARAM)hf, TRUE);
+                    y += btnH + DpiScale(6);
+                    };
+
+                addBtn(9201, L"1) Deinterlace + Repair + upscale (rare)");
+                addBtn(9202, L"2) Repair+ (2-pass) + upscale (rare)");
+                addBtn(9203, L"3) General + Grain + upscale");
+                addBtn(9204, L"4) Repair + Grain + upscale");
+                return 0;
+            }
+            case WM_COMMAND: {
+                int id = LOWORD(ww);
+                if (id >= 9201 && id <= 9204) {
+                    if (c) { c->ok = true; c->id = id; }
+                    DestroyWindow(hh);
+                    return 0;
+                }
+                break;
+            }
+            case WM_KEYDOWN:
+                if (ww == VK_ESCAPE) { DestroyWindow(hh); return 0; }
+                break;
+            case WM_CLOSE:
+                DestroyWindow(hh); return 0;
+            }
+            return DefWindowProcW(hh, mm, ww, ll);
+            };
+        RegisterClassW(&wc);
+        reg2 = true;
+    }
+
+    Ctx2 c2;
+    runModal(L"TopazMoreClass", L"Topaz Upscale (More)", DpiScale(460), DpiScale(250), &c2);
+    if (!c2.ok) return false;
+
+    if (c2.id == 9201) { outProfile = TopazProfile::DeinterlaceRepair; return true; }
+    if (c2.id == 9202) { outProfile = TopazProfile::Repair2Pass;       return true; }
+    if (c2.id == 9203) { outProfile = TopazProfile::GeneralGrain; outGrain = 0.01; outGsize = 1; return true; }
+    if (c2.id == 9204) { outProfile = TopazProfile::RepairGrain;  outGrain = 0.01; outGsize = 1; return true; }
+
+    return false;
+}
+
+static bool PromptTopazOptionsModal(TopazJobOptions& outOpt)
+{
+    TopazTarget tgt{};
+    if (!PromptTopazTargetModal(tgt)) return false;
+
+    TopazProfile prof{};
+    double grain = 0.0;
+    int gsize = 1;
+    if (!PromptTopazProfileModal(prof, grain, gsize)) return false;
+
+    outOpt = TopazJobOptions{};
+    outOpt.target = tgt;
+    outOpt.profile = prof;
+    outOpt.grain = grain;
+    outOpt.gsize = gsize;
+    return true;
+}
+
+static void HandleTopazSubmitFromListSelection()
+{
+    // Must be in a file list (not drives)
+    if (g_view == ViewKind::Drives) return;
+
+    // Preflight
+    if (g_cfg.topazUpscaleQueue.empty()) {
+        MessageBoxW(g_hwndMain,
+            L"TopazUpscaleQueue is not configured.\n"
+            L"Set 'topazUpscaleQueue = ...' in mediaexplorer.ini.",
+            L"Topaz submit", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (!CanWriteToDir(g_cfg.topazUpscaleQueue)) {
+        std::wstring msg = L"TopazUpscaleQueue path is not accessible/writable:\n\n";
+        msg += g_cfg.topazUpscaleQueue;
+        msg += L"\n\nFix drive mapping or update mediaexplorer.ini.";
+        MessageBoxW(g_hwndMain, msg.c_str(), L"Topaz submit", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Collect selected video files
+    std::vector<std::wstring> files;
+    int idx = -1;
+    while ((idx = ListView_GetNextItem(g_hwndList, idx, LVNI_SELECTED)) != -1) {
+        if (idx < 0 || idx >= (int)g_rows.size()) continue;
+        const Row& r = g_rows[idx];
+        if (!r.isDir && IsVideoFile(r.full)) files.push_back(r.full);
+    }
+
+    if (files.empty()) {
+        MessageBoxW(g_hwndMain, L"Select one or more video files first.", L"Topaz submit", MB_OK);
+        return;
+    }
+
+    // Prompt user for options (4K/8K + profile)
+    TopazJobOptions opt;
+    if (!PromptTopazOptionsModal(opt)) return;
+
+    // Queue task (background copy + write ._json -> .json)
+    FileOpTask* t = new FileOpTask();
+    t->kind = FileOpKind::TopazSubmit;
+    t->srcFiles = files;
+    t->dstFolder = EnsureSlash(g_cfg.topazUpscaleQueue);
+    t->title = (opt.target == TopazTarget::K8) ? L"Topaz submit (8K)" : L"Topaz submit (4K)";
+    t->topaz = opt;
+    t->running = true;
+
+    StartFileOpTask(t);
+}
+
+// ----------------------------- Subclasses
 // ----------------------------- Subclasses
 static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
-    UINT_PTR, DWORD_PTR) {
+    UINT_PTR, DWORD_PTR)
+{
     if (m == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
+
     if (m == WM_KEYDOWN) {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
@@ -4122,74 +5034,90 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             return 0;
         }
 
+        // Topaz submit: Ctrl+U  (works in Folder or Search view)
+        if (ctrl && w == 'U') {
+            HandleTopazSubmitFromListSelection();
+            return 0;
+        }
+
         switch (w) {
         case VK_RETURN: ActivateSelection(); return 0;
         case VK_LEFT:
         case VK_BACK:   NavigateBack(); return 0;
         case VK_F1:     ShowHelp(); return 0;
 
-        case 'A': if (ctrl) {
-            for (int i = 0; i < (int)g_rows.size(); ++i) {
-                if (!g_rows[i].isDir) {
-                    ListView_SetItemState(g_hwndList, i, LVIS_SELECTED, LVIS_SELECTED);
+        case 'A':
+            if (ctrl) {
+                for (int i = 0; i < (int)g_rows.size(); ++i) {
+                    if (!g_rows[i].isDir) {
+                        ListView_SetItemState(g_hwndList, i, LVIS_SELECTED, LVIS_SELECTED);
+                    }
+                    else {
+                        ListView_SetItemState(g_hwndList, i, 0, LVIS_SELECTED);
+                    }
+                }
+                return 0;
+            }
+            break;
+
+        case 'P':
+            if (ctrl) { PlaySelectedVideos(); return 0; }
+            break;
+
+        case 'F':
+            if (ctrl) {
+                std::wstring kw;
+                if (!PromptKeyword(kw)) return 0;
+                kw = ToLower(kw);
+                if (kw.empty()) return 0;
+
+                if (g_view != ViewKind::Search) {
+                    g_search.active = true;
+                    g_search.originView = g_view;
+                    g_search.originFolder = (g_view == ViewKind::Folder ? g_folder : L"");
+                    g_search.termsLower.clear();
+                    g_search.termsLower.push_back(kw);
+
+                    g_search.useExplicitScope = false;
+                    g_search.explicitFolders.clear();
+                    g_search.explicitFiles.clear();
+
+                    std::vector<std::wstring> selFolders, selFiles;
+                    CollectSelection(selFolders, selFiles);
+                    if (!selFolders.empty() || !selFiles.empty()) {
+                        g_search.useExplicitScope = true;
+                        g_search.explicitFolders.swap(selFolders);
+                        g_search.explicitFiles.swap(selFiles);
+                    }
+
+                    std::vector<Row> res;
+                    RunSearchFromOrigin(res);
+                    ShowSearchResults(res);
                 }
                 else {
-                    ListView_SetItemState(g_hwndList, i, 0, LVIS_SELECTED);
+                    g_search.termsLower.push_back(kw);
+                    std::vector<Row> filtered;
+                    filtered.reserve(g_rows.size());
+                    for (size_t i = 0; i < g_rows.size(); ++i) {
+                        if (NameContainsAllTerms(g_rows[i].full, g_search.termsLower))
+                            filtered.push_back(g_rows[i]);
+                    }
+                    ShowSearchResults(filtered);
                 }
+                return 0;
             }
-            return 0;
-        }
-        case 'P': if (ctrl) { PlaySelectedVideos(); return 0; }
+            break;
 
-        case 'F': if (ctrl) {
-            std::wstring kw;
-            if (!PromptKeyword(kw)) return 0;
-            kw = ToLower(kw);
-            if (kw.empty()) return 0;
-
-            if (g_view != ViewKind::Search) {
-                g_search.active = true;
-                g_search.originView = g_view;
-                g_search.originFolder = (g_view == ViewKind::Folder ? g_folder : L"");
-                g_search.termsLower.clear();
-                g_search.termsLower.push_back(kw);
-
-                g_search.useExplicitScope = false;
-                g_search.explicitFolders.clear();
-                g_search.explicitFiles.clear();
-
-                std::vector<std::wstring> selFolders, selFiles;
-                CollectSelection(selFolders, selFiles);
-                if (!selFolders.empty() || !selFiles.empty()) {
-                    g_search.useExplicitScope = true;
-                    g_search.explicitFolders.swap(selFolders);
-                    g_search.explicitFiles.swap(selFiles);
-                }
-
-                std::vector<Row> res;
-                RunSearchFromOrigin(res);
-                ShowSearchResults(res);
-            }
-            else {
-                g_search.termsLower.push_back(kw);
-                std::vector<Row> filtered;
-                filtered.reserve(g_rows.size());
-                for (size_t i = 0; i < g_rows.size(); ++i) {
-                    if (NameContainsAllTerms(g_rows[i].full, g_search.termsLower)) filtered.push_back(g_rows[i]);
-                }
-                ShowSearchResults(filtered);
-            }
-            return 0;
-        }
-
-        case 'C': if (ctrl) { Browser_CopySelectedToClipboard(ClipMode::Copy); return 0; }
-        case 'X': if (ctrl) { Browser_CopySelectedToClipboard(ClipMode::Move); return 0; }
-        case 'V': if (ctrl) { Browser_PasteClipboardIntoCurrent(); return 0; }
+        case 'C': if (ctrl) { Browser_CopySelectedToClipboard(ClipMode::Copy); return 0; } break;
+        case 'X': if (ctrl) { Browser_CopySelectedToClipboard(ClipMode::Move); return 0; } break;
+        case 'V': if (ctrl) { Browser_PasteClipboardIntoCurrent(); return 0; } break;
         case VK_DELETE: Browser_DeleteSelected(); return 0;
         }
     }
+
     return DefSubclassProc(h, m, w, l);
 }
+
 
 // ----------------------------- Post-playback upscale submit
 
@@ -4493,9 +5421,29 @@ static HICON LoadAppIcon(int cx, int cy) {
 }
 
 // ----------------------------- Window proc
-LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
+{
+    // keep your existing code unchanged by providing aliases:
+    HWND   h = hWnd;
+    WPARAM w = wParam;
+    LPARAM l = lParam;
+
     switch (m) {
     case WM_CREATE: {
+        g_hwndMain = hWnd;
+
+        // Create a single-line status bar at the bottom
+        g_hwndStatus = CreateWindowExW(
+            0, STATUSCLASSNAMEW, nullptr,
+            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+            0, 0, 0, 0,
+            hWnd, (HMENU)IDC_STATUSBAR, (HINSTANCE)GetWindowLongPtrW(hWnd, GWLP_HINSTANCE), nullptr
+        );
+
+        // Single-part (simple) mode
+        SendMessageW(g_hwndStatus, SB_SIMPLE, TRUE, 0);
+        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"");
+
         InitializeCriticalSection(&g_fileLock);
         INITCOMMONCONTROLSEX icc; icc.dwSize = sizeof(icc);
         icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
@@ -4530,8 +5478,31 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     case WM_SIZE:
-        OnSize(LOWORD(l), HIWORD(l));
+    {
+        if (g_hwndStatus) SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
+
+        RECT rcClient{};
+        GetClientRect(hWnd, &rcClient);
+
+        int statusH = 0;
+        if (g_hwndStatus)
+        {
+            RECT rcStatus{};
+            GetWindowRect(g_hwndStatus, &rcStatus);
+            statusH = (rcStatus.bottom - rcStatus.top);
+        }
+
+        // Resize your main list (or whatever main child window)
+        if (g_hwndList)
+        {
+            MoveWindow(g_hwndList,
+                0, 0,
+                rcClient.right - rcClient.left,
+                (rcClient.bottom - rcClient.top) - statusH,
+                TRUE);
+        }
         return 0;
+    }
 
     case WM_SETFOCUS:
         if (g_inPlayback) SetFocus(g_hwndVideo);
@@ -4545,6 +5516,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ActivateSelection(); return 0;
             }
             if (nm->code == LVN_COLUMNCLICK) {
+                if (g_view == ViewKind::Drives)
+                    return 0; // no sorting in drives view
                 LPNMLISTVIEW p = reinterpret_cast<LPNMLISTVIEW>(l);
                 if (p->iSubItem == g_sortCol) g_sortAsc = !g_sortAsc;
                 else { g_sortCol = p->iSubItem; g_sortAsc = true; }
@@ -4744,6 +5717,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+
+    case WMU_STATUS_OP:
+    {
+        std::unique_ptr<StatusOpMsg> msg((StatusOpMsg*)lParam);
+
+        switch (msg->action)
+        {
+        case StatusOpAction::Begin:  g_statusOps.begin(msg->id, std::move(msg->text)); break;
+        case StatusOpAction::Update: g_statusOps.update(msg->id, std::move(msg->text)); break;
+        case StatusOpAction::End:    g_statusOps.end(msg->id); break;
+        }
+        RefreshStatusBar();
+        return 0;
+    }
+
 
     case WM_APP_FFMPEG_OUTPUT: {
         FfmpegTask* task = (FfmpegTask*)w;
@@ -4946,6 +5934,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     LoadConfigFromIni();
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES | ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icc);
 
     int bigW = GetSystemMetrics(SM_CXICON), bigH = GetSystemMetrics(SM_CYICON);
     int smW = GetSystemMetrics(SM_CXSMICON), smH = GetSystemMetrics(SM_CYSMICON);
