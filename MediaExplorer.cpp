@@ -83,6 +83,8 @@
 using Microsoft::WRL::ComPtr;
 
 static void LogLine(const wchar_t* fmt, ...); // forward declaration
+// Forward-declare DPI scaler because some dialogs use it before the definition below.
+static int DpiScale(int px);
 
 // ----------------------------- Globals
 HINSTANCE g_hInst = NULL;
@@ -328,6 +330,16 @@ private:
 static StatusOpTracker g_statusOps;
 static std::wstring    g_lastStatusLine;
 
+// ---- Status bar text helper (DROP-IN)
+static void StatusBarSetText(const std::wstring& text)
+{
+    if (!g_hwndStatus || !IsWindow(g_hwndStatus)) return;
+
+    const BOOL simple = (BOOL)SendMessageW(g_hwndStatus, SB_ISSIMPLE, 0, 0);
+    const WPARAM part = simple ? (WPARAM)SB_SIMPLEID : 0; // SB_SIMPLEID == 255
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, part, (LPARAM)text.c_str());
+}
+
 static void RefreshStatusBar()
 {
     if (!g_hwndStatus) return;
@@ -336,7 +348,7 @@ static void RefreshStatusBar()
     if (line == g_lastStatusLine) return;
     g_lastStatusLine = line;
 
-    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)g_lastStatusLine.c_str());
+    StatusBarSetText(g_lastStatusLine);
 }
 
 static void PostStatusMsg(StatusOpMsg* msg)
@@ -387,6 +399,26 @@ struct TopazJobOptions {
     
 };
 
+// ----------------------------- Multi-monitor placement helpers (DROP-IN)
+
+
+static void GetWorkAreaForOwner(HWND owner, RECT& outWA)
+{
+    HMONITOR hm = MonitorFromWindow(owner ? owner : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    if (GetMonitorInfoW(hm, &mi)) {
+        outWA = mi.rcWork;     // work area (excludes taskbar)
+        return;
+    }
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &outWA, 0); // fallback
+}
+
+static void CenterInWorkArea(const RECT& wa, int W, int H, int& outX, int& outY)
+{
+    outX = wa.left + ((wa.right - wa.left) - W) / 2;
+    outY = wa.top + ((wa.bottom - wa.top) - H) / 2;
+}
+
 struct FileOpTask {
     HANDLE hThread = NULL;
     HWND   hwnd = NULL;     // log window
@@ -417,6 +449,11 @@ struct FileOpTask {
     bool done = false;
     DWORD exitCode = 0;
     bool hiddenByPlayback = false;
+
+    // --- status-bar-first (DROP-IN)
+    uint64_t     statusId = 0;          // StatusOpBegin() id
+    bool         wantWindow = false;    // default false; only show log window on failure
+    std::wstring bufferedOutput;        // captured output when no window is shown
 };
 
 static std::string JsonEscapeUtf8(const std::string & s) {
@@ -503,6 +540,24 @@ static void BuildTopazJobJsonUtf8(const std::wstring & originalFull,
 
 CRITICAL_SECTION g_fileLock;
 std::vector<FileOpTask*> g_fileTasks;
+
+// Cancel the most recently started running file-op task (Esc in list view)
+static void CancelMostRecentFileOpTask()
+{
+    FileOpTask* found = nullptr;
+    EnterCriticalSection(&g_fileLock);
+    for (auto it = g_fileTasks.rbegin(); it != g_fileTasks.rend(); ++it) {
+        FileOpTask* t = *it;
+        if (t && t->running && !t->done) { found = t; break; }
+    }
+    LeaveCriticalSection(&g_fileLock);
+
+    if (!found) return;
+    found->cancel.store(true, std::memory_order_relaxed);
+    if (found->statusId) StatusOpUpdate(found->statusId, found->title + L" (cancelling...)");
+}
+
+
 // ---- Forward decls (needed because Browser_* uses these before their definitions)
 static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder);
 
@@ -828,10 +883,9 @@ static void EnsureFfmpegLogClass() {
 }
 
 static HWND CreateFfmpegLogWindow(FfmpegTask* task) {
-    RECT r; SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0);
-    int W = 640, H = 480;
-    int X = r.left + ((r.right - r.left) - W) / 2;
-    int Y = r.top + ((r.bottom - r.top) - H) / 2;
+    RECT wa{}; GetWorkAreaForOwner(g_hwndMain, wa);
+    int W = DpiScale(640), H = DpiScale(480);
+    int X = 0, Y = 0; CenterInWorkArea(wa, W, H, X, Y);
 
     std::wstring title = L"FFmpeg task: ";
     title += task ? task->title : L"(unknown)";
@@ -3663,6 +3717,7 @@ static LRESULT CALLBACK PickerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static void ShowPlaylistChooser() {
     if (!g_inPlayback || g_playlist.empty()) return;
     if (g_mp) libvlc_media_player_set_pause(g_mp, 1);
+
     static bool registered = false;
     if (!registered) {
         WNDCLASSW wc; ZeroMemory(&wc, sizeof(wc));
@@ -3673,10 +3728,11 @@ static void ShowPlaylistChooser() {
         RegisterClassW(&wc);
         registered = true;
     }
-    RECT r; SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0);
-    int W = 520, H = 420;
-    int X = r.left + ((r.right - r.left) - W) / 2;
-    int Y = r.top + ((r.bottom - r.top) - H) / 2;
+
+    RECT wa{}; GetWorkAreaForOwner(g_hwndMain, wa);
+    int W = DpiScale(520), H = DpiScale(420);
+    int X = 0, Y = 0; CenterInWorkArea(wa, W, H, X, Y);
+
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"PlaylistPickerClass", L"Playlist",
         WS_POPUPWINDOW | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         X, Y, W, H, g_hwndMain, NULL, g_hInst, NULL);
@@ -3737,10 +3793,9 @@ static void EnsureCombineLogClass() {
 }
 
 static HWND CreateCombineLogWindow(CombineTask* task) {
-    RECT r; SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0);
-    int W = 640, H = 480;
-    int X = r.left + ((r.right - r.left) - W) / 2;
-    int Y = r.top + ((r.bottom - r.top) - H) / 2;
+    RECT wa{}; GetWorkAreaForOwner(g_hwndMain, wa);
+    int W = DpiScale(640), H = DpiScale(480);
+    int X = 0, Y = 0; CenterInWorkArea(wa, W, H, X, Y);
 
     std::wstring title = L"Combine: ";
     title += task ? task->title : L"(unknown)";
@@ -3752,9 +3807,6 @@ static HWND CreateCombineLogWindow(CombineTask* task) {
     if (hwnd && task)
     {
         task->hwnd = hwnd;
-
-        // If playback is already active when this window is created,
-        // keep it hidden and mark it so we restore it at playback exit.
         if (g_inPlayback)
         {
             if (IsWindowVisible(hwnd))
@@ -3846,10 +3898,9 @@ static void EnsureFileOpLogClass() {
 }
 
 static HWND CreateFileOpLogWindow(FileOpTask* task) {
-    RECT r; SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0);
-    int W = 720, H = 520;
-    int X = r.left + ((r.right - r.left) - W) / 2;
-    int Y = r.top + ((r.bottom - r.top) - H) / 2;
+    RECT wa{}; GetWorkAreaForOwner(g_hwndMain, wa);
+    int W = DpiScale(720), H = DpiScale(520);
+    int X = 0, Y = 0; CenterInWorkArea(wa, W, H, X, Y);
 
     std::wstring title = L"File op: ";
     title += task ? task->title : L"(unknown)";
@@ -3874,6 +3925,122 @@ static void PostFileOpOutput(FileOpTask* task, const std::wstring& text) {
     PostMessageW(g_hwndMain, WM_APP_FILEOP_OUTPUT, (WPARAM)task, (LPARAM)p);
 }
 
+// ---- FileOp status-bar-first helpers (place AFTER PostFileOpOutput)
+
+// Buffer up to 64 KB of output when we are running "status-bar-only" (no window)
+static constexpr size_t kFileOpBufferMax = 64 * 1024;
+
+static void FileOpAppendBuffer(FileOpTask* task, const std::wstring& text)
+{
+    if (!task || text.empty()) return;
+    if (task->bufferedOutput.size() >= kFileOpBufferMax) return;
+    size_t remain = kFileOpBufferMax - task->bufferedOutput.size();
+    task->bufferedOutput.append(text.substr(0, remain));
+}
+
+// Emit file-op text:
+// - If we have a window: route through WM_APP_FILEOP_OUTPUT (UI thread updates)
+// - If no window: buffer it so we can dump it if the task fails/cancels
+static void FileOpEmit(FileOpTask* task, const std::wstring& text)
+{
+    if (!task) return;
+
+    if (task->hwnd && IsWindow(task->hwnd)) {
+        PostFileOpOutput(task, text);
+        return;
+    }
+
+    FileOpAppendBuffer(task, text);
+
+    if (g_cfg.loggingEnabled && !text.empty()) {
+        LogLine(L"[FileOp] %s", text.c_str());
+    }
+}
+
+// Handle completion on the UI thread (called from WM_APP_FILEOP_DONE)
+static void OnFileOpDone(FileOpTask* task, DWORD rc)
+{
+    if (!task) return;
+
+    // Close thread handle
+    if (task->hThread) {
+        CloseHandle(task->hThread);
+        task->hThread = NULL;
+    }
+
+    const bool isPlaybackExitTask = task->fromPlaybackExit;
+    const uint32_t gen = task->playbackExitGen;
+
+    // End status-bar op
+    if (task->statusId) {
+        StatusOpEnd(task->statusId);
+        task->statusId = 0;
+    }
+
+    // Status-bar-only: on failure/cancel, pop the log window on the correct monitor
+    const bool cancelled = (rc == ERROR_CANCELLED || rc == ERROR_REQUEST_ABORTED);
+    if (!task->wantWindow && (!task->hwnd || !IsWindow(task->hwnd)) && rc != 0 && !cancelled) {
+        EnsureFileOpLogClass();
+        HWND wnd = CreateFileOpLogWindow(task);
+        task->hwnd = wnd;
+
+        if (task->hEdit && !task->bufferedOutput.empty()) {
+            SetWindowTextW(task->hEdit, task->bufferedOutput.c_str());
+            SendMessageW(task->hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+            SendMessageW(task->hEdit, EM_SCROLLCARET, 0, 0);
+        }
+        if (task->hCancel) EnableWindow(task->hCancel, FALSE);
+
+        if (wnd) {
+            ShowWindow(wnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(wnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    // Auto-close on success (and delete task)
+    if (rc == 0) {
+        if (task->hwnd && IsWindow(task->hwnd)) {
+            DestroyWindow(task->hwnd);
+        }
+        task->hwnd = NULL;
+        task->hEdit = NULL;
+        task->hCancel = NULL;
+
+        EnterCriticalSection(&g_fileLock);
+        auto it = std::find(g_fileTasks.begin(), g_fileTasks.end(), task);
+        if (it != g_fileTasks.end()) g_fileTasks.erase(it);
+        LeaveCriticalSection(&g_fileLock);
+
+        delete task;
+        task = nullptr;
+    }
+
+    // Playback-exit batch countdown logic (your existing behavior)
+    if (isPlaybackExitTask && gen != 0 && gen == g_pbExitBatchActive) {
+        if (g_pbExitPending > 0) --g_pbExitPending;
+
+        if (g_pbExitPending <= 0 && g_pbExitWantsReload) {
+            if (!g_inPlayback &&
+                g_view == ViewKind::Folder &&
+                _wcsicmp(g_folder.c_str(), g_pbExitFolder.c_str()) == 0)
+            {
+                StartBackgroundFolderReload(g_pbExitFolder);
+            }
+
+            g_pbExitWantsReload = false;
+            g_pbExitBatchActive = 0;
+            g_pbExitPending = 0;
+            g_pbExitFolder.clear();
+        }
+    }
+
+    // Normal tasks refresh the view when not in playback
+    if (!g_inPlayback && !isPlaybackExitTask) {
+        RefreshCurrentView();
+    }
+}
+
 static DWORD CALLBACK FileOpCopyProgressThunk(
     LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER,
     DWORD, DWORD, HANDLE, HANDLE, LPVOID lpData)
@@ -3887,7 +4054,8 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
     FileOpTask* task = (FileOpTask*)param;
     if (!task) return 0;
 
-    PostFileOpOutput(task, L"Starting...\r\n\r\n");
+    FileOpEmit(task, L"Starting...\r\n\r\n");
+    if (task->statusId) StatusOpUpdate(task->statusId, task->title);
 
     DWORD rc = 0;
 
@@ -3901,6 +4069,16 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
             const std::wstring& src = task->srcFiles[i];
             const wchar_t* base = wcsrchr(src.c_str(), L'\\'); base = base ? base + 1 : src.c_str();
 
+            if (task->statusId) {
+                std::wstring st = (isCopy ? L"Copy " : L"Move ");
+                st += std::to_wstring(i + 1);
+                st += L"/";
+                st += std::to_wstring(total);
+                st += L": ";
+                st += base;
+                StatusOpUpdate(task->statusId, st);
+            }
+
             wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
             _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
 
@@ -3910,9 +4088,9 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
                 wchar_t hdr[256];
                 swprintf_s(hdr, L"%s %zu of %zu:\r\n",
                     isCopy ? L"Copying" : L"Moving", i + 1, total);
-                PostFileOpOutput(task, hdr);
-                PostFileOpOutput(task, L"  From: " + src + L"\r\n");
-                PostFileOpOutput(task, L"  To  : " + dst + L"\r\n");
+                FileOpEmit(task, hdr);
+                FileOpEmit(task, L"  From: " + src + L"\r\n");
+                FileOpEmit(task, L"  To  : " + dst + L"\r\n");
             }
 
             BOOL ok = FALSE;
@@ -3951,13 +4129,12 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
             if (!ok) {
                 wchar_t buf[256];
                 swprintf_s(buf, L"ERROR: operation failed (err=%lu)\r\n\r\n", err);
-                PostFileOpOutput(task, buf);
+                FileOpEmit(task, buf);
                 rc = (err ? err : 1);
-                // keep going or stop? (I stop on first failure)
                 break;
             }
 
-            PostFileOpOutput(task, L"OK\r\n\r\n");
+            FileOpEmit(task, L"OK\r\n\r\n");
         }
     }
     else if (task->kind == FileOpKind::DeleteFiles) {
@@ -3966,11 +4143,22 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
             if (task->cancel.load(std::memory_order_relaxed)) { rc = ERROR_CANCELLED; break; }
 
             const std::wstring& p = task->srcFiles[i];
+            const wchar_t* base = wcsrchr(p.c_str(), L'\\'); base = base ? base + 1 : p.c_str();
+
+            if (task->statusId) {
+                std::wstring st = L"Delete ";
+                st += std::to_wstring(i + 1);
+                st += L"/";
+                st += std::to_wstring(total);
+                st += L": ";
+                st += base;
+                StatusOpUpdate(task->statusId, st);
+            }
 
             wchar_t hdr[256];
             swprintf_s(hdr, L"Deleting %zu of %zu:\r\n", i + 1, total);
-            PostFileOpOutput(task, hdr);
-            PostFileOpOutput(task, L"  " + p + L"\r\n");
+            FileOpEmit(task, hdr);
+            FileOpEmit(task, L"  " + p + L"\r\n");
 
             if (!DeleteFileW(p.c_str())) {
                 DWORD err = GetLastError();
@@ -3978,23 +4166,30 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
 
                 wchar_t buf[256];
                 swprintf_s(buf, L"  FAILED (err=%lu) -> queued delete on reboot\r\n\r\n", err);
-                PostFileOpOutput(task, buf);
+                FileOpEmit(task, buf);
 
-                // keep going
                 if (rc == 0) rc = err ? err : 1;
             }
             else {
-                PostFileOpOutput(task, L"  OK\r\n\r\n");
+                FileOpEmit(task, L"  OK\r\n\r\n");
             }
         }
     }
     else if (task->kind == FileOpKind::CopyToPath) {
         if (task->srcSingle.empty() || task->dstPath.empty()) {
-            PostFileOpOutput(task, L"ERROR: missing src/dst.\r\n");
+            FileOpEmit(task, L"ERROR: missing src/dst.\r\n");
             rc = 2;
         }
         else {
-            PostFileOpOutput(task, L"Copying:\r\n  From: " + task->srcSingle + L"\r\n  To  : " + task->dstPath + L"\r\n\r\n");
+            const wchar_t* base = wcsrchr(task->srcSingle.c_str(), L'\\');
+            base = base ? base + 1 : task->srcSingle.c_str();
+            if (task->statusId) {
+                std::wstring st = L"Copy: ";
+                st += base;
+                StatusOpUpdate(task->statusId, st);
+            }
+
+            FileOpEmit(task, L"Copying:\r\n  From: " + task->srcSingle + L"\r\n  To  : " + task->dstPath + L"\r\n\r\n");
 
             BOOL cancelFlag = FALSE;
             BOOL ok = CopyFileExW(task->srcSingle.c_str(), task->dstPath.c_str(),
@@ -4007,130 +4202,126 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
 
                 wchar_t buf[256];
                 swprintf_s(buf, L"ERROR: copy failed (err=%lu)\r\n", (unsigned long)rc);
-                PostFileOpOutput(task, buf);
+                FileOpEmit(task, buf);
             }
             else {
-                PostFileOpOutput(task, L"OK\r\n");
+                FileOpEmit(task, L"OK\r\n");
                 rc = 0;
             }
         }
     }
     else if (task->kind == FileOpKind::TopazSubmit) {
-         // Copy each selected source video to the Topaz queue directory and write <base>._json then rename to <base>.json
-         const size_t total = task->srcFiles.size();
-         if (task->dstFolder.empty()) {
-             PostFileOpOutput(task, L"ERROR: Topaz queue directory not set.\r\n");
-             rc = 2;
-            
-         }
-         else {
-             for (size_t i = 0; i < total; ++i) {
-                 if (task->cancel.load(std::memory_order_relaxed)) { rc = ERROR_CANCELLED; break; }
-                 
-                 const std::wstring & src = task->srcFiles[i];
-                 const wchar_t* base = wcsrchr(src.c_str(), L'\\'); base = base ? base + 1 : src.c_str();
-                
-                 wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
-                 _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
-                 
-                 // Pick a unique destination video name in queue
-                 std::wstring dstVideo = UniqueName(task->dstFolder, fname, ext);
-                
-                 // Derive json path from the chosen dstVideo base name
-                 const wchar_t* dstBase = wcsrchr(dstVideo.c_str(), L'\\');
-                 dstBase = dstBase ? dstBase + 1 : dstVideo.c_str();
-                
-                 wchar_t dstF[_MAX_FNAME] = {}, dstE[_MAX_EXT] = {};
-                 _wsplitpath_s(dstBase, NULL, 0, NULL, 0, dstF, _MAX_FNAME, dstE, _MAX_EXT);
-                
-                 std::wstring jsonFinal = task->dstFolder + dstF + L".json";
-                 std::wstring jsonTemp = task->dstFolder + dstF + L"._json";
-                
-                 // If json already exists (rare), force a different name by appending (N)
-                 int bump = 1;
-                 while (PathFileExistsW(jsonFinal.c_str()) || PathFileExistsW(jsonTemp.c_str())) {
+        const size_t total = task->srcFiles.size();
+        if (task->dstFolder.empty()) {
+            FileOpEmit(task, L"ERROR: Topaz queue directory not set.\r\n");
+            rc = 2;
+        }
+        else {
+            for (size_t i = 0; i < total; ++i) {
+                if (task->cancel.load(std::memory_order_relaxed)) { rc = ERROR_CANCELLED; break; }
+
+                const std::wstring& src = task->srcFiles[i];
+                const wchar_t* base = wcsrchr(src.c_str(), L'\\'); base = base ? base + 1 : src.c_str();
+
+                if (task->statusId) {
+                    std::wstring st = L"Topaz ";
+                    st += std::to_wstring(i + 1);
+                    st += L"/";
+                    st += std::to_wstring(total);
+                    st += L": ";
+                    st += base;
+                    StatusOpUpdate(task->statusId, st);
+                }
+
+                wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
+                _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+
+                std::wstring dstVideo = UniqueName(task->dstFolder, fname, ext);
+
+                const wchar_t* dstBase = wcsrchr(dstVideo.c_str(), L'\\');
+                dstBase = dstBase ? dstBase + 1 : dstVideo.c_str();
+
+                wchar_t dstF[_MAX_FNAME] = {}, dstE[_MAX_EXT] = {};
+                _wsplitpath_s(dstBase, NULL, 0, NULL, 0, dstF, _MAX_FNAME, dstE, _MAX_EXT);
+
+                std::wstring jsonFinal = task->dstFolder + dstF + L".json";
+                std::wstring jsonTemp = task->dstFolder + dstF + L"._json";
+
+                int bump = 1;
+                while (PathFileExistsW(jsonFinal.c_str()) || PathFileExistsW(jsonTemp.c_str())) {
                     wchar_t suf[32]; swprintf_s(suf, L" (%d)", bump++);
                     std::wstring newBase = std::wstring(dstF) + suf;
                     dstVideo = task->dstFolder + newBase + dstE;
                     jsonFinal = task->dstFolder + newBase + L".json";
                     jsonTemp = task->dstFolder + newBase + L"._json";
-                    
-                 }
-                
-                 // Header
-                 {
-                     wchar_t hdr[256];
-                     swprintf_s(hdr, L"Topaz submit %zu of %zu:\r\n", i + 1, total);
-                     PostFileOpOutput(task, hdr);
-                     PostFileOpOutput(task, L"  From: " + src + L"\r\n");
-                     PostFileOpOutput(task, L"  To  : " + dstVideo + L"\r\n");
-                 }
-                
-                     // Copy file (cancelable)
-                 BOOL cancelFlag = FALSE;
-                 BOOL ok = CopyFileExW(src.c_str(), dstVideo.c_str(),
-                 FileOpCopyProgressThunk, task, &cancelFlag, 0);
-                
-                 if (!ok) {
+                }
+
+                {
+                    wchar_t hdr[256];
+                    swprintf_s(hdr, L"Topaz submit %zu of %zu:\r\n", i + 1, total);
+                    FileOpEmit(task, hdr);
+                    FileOpEmit(task, L"  From: " + src + L"\r\n");
+                    FileOpEmit(task, L"  To  : " + dstVideo + L"\r\n");
+                }
+
+                BOOL cancelFlag = FALSE;
+                BOOL ok = CopyFileExW(src.c_str(), dstVideo.c_str(),
+                    FileOpCopyProgressThunk, task, &cancelFlag, 0);
+
+                if (!ok) {
                     DWORD err = GetLastError();
                     if (cancelFlag || task->cancel.load()) rc = ERROR_CANCELLED;
                     else rc = err ? err : 1;
+
                     wchar_t buf[256];
                     swprintf_s(buf, L"ERROR: copy failed (err=%lu)\r\n\r\n", (unsigned long)rc);
-                    PostFileOpOutput(task, buf);
+                    FileOpEmit(task, buf);
                     break;
-                    
-                 }
-                
-                 // Write JSON temp then rename to .json (atomic publish)
-                 {
-                     const wchar_t* q = wcsrchr(dstVideo.c_str(), L'\\');
-                     std::wstring queuedNameOnly = q ? (q + 1) : dstVideo;
+                }
+
+                {
+                    const wchar_t* q = wcsrchr(dstVideo.c_str(), L'\\');
+                    std::wstring queuedNameOnly = q ? (q + 1) : dstVideo;
 
                     std::string jsonUtf8;
                     BuildTopazJobJsonUtf8(src, queuedNameOnly, task->topaz, jsonUtf8);
-                    
+
                     HANDLE h = CreateFileW(jsonTemp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
+                        FILE_ATTRIBUTE_NORMAL, NULL);
                     if (h == INVALID_HANDLE_VALUE) {
                         rc = GetLastError() ? GetLastError() : 5;
-                        PostFileOpOutput(task, L"ERROR: failed to create job ._json file.\r\n\r\n");
+                        FileOpEmit(task, L"ERROR: failed to create job ._json file.\r\n\r\n");
                         break;
-                        
                     }
+
                     DWORD wrote = 0;
                     BOOL wok = WriteFile(h, jsonUtf8.data(), (DWORD)jsonUtf8.size(), &wrote, NULL);
                     CloseHandle(h);
                     if (!wok || wrote != (DWORD)jsonUtf8.size()) {
                         rc = GetLastError() ? GetLastError() : 6;
-                        PostFileOpOutput(task, L"ERROR: failed to write job ._json file.\r\n\r\n");
+                        FileOpEmit(task, L"ERROR: failed to write job ._json file.\r\n\r\n");
                         break;
-                        
                     }
+
                     if (!MoveFileExW(jsonTemp.c_str(), jsonFinal.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
                         rc = GetLastError() ? GetLastError() : 7;
-                        PostFileOpOutput(task, L"ERROR: failed to publish job json (rename).\r\n\r\n");
+                        FileOpEmit(task, L"ERROR: failed to publish job json (rename).\r\n\r\n");
                         break;
-                        
                     }
-                 }
-                
-                    PostFileOpOutput(task, L"OK (queued)\r\n\r\n");
-                
+                }
+
+                FileOpEmit(task, L"OK (queued)\r\n\r\n");
             }
-            
         }
-        
     }
 
-
     if (rc == ERROR_CANCELLED) {
-        PostFileOpOutput(task, L"\r\n[CANCELLED]\r\n");
+        FileOpEmit(task, L"\r\n[CANCELLED]\r\n");
     }
 
     wchar_t doneMsg[128];
     swprintf_s(doneMsg, L"\r\n[done rc=%lu]\r\n", (unsigned long)rc);
-    PostFileOpOutput(task, doneMsg);
+    FileOpEmit(task, doneMsg);
 
     task->exitCode = rc;
     task->running = false;
@@ -4159,14 +4350,21 @@ static void RefreshCurrentView() {
 static void StartFileOpTask(FileOpTask* task) {
     if (!task) return;
 
-    EnsureFileOpLogClass();
-    HWND logWnd = CreateFileOpLogWindow(task);
-    if (!logWnd) {
-        delete task;
-        MessageBoxW(g_hwndMain, L"Failed to create file-op log window.", L"File operation", MB_OK);
-        return;
+    // Begin status-bar op immediately (LIFO stack behavior)
+    task->statusId = StatusOpBegin(task->title);
+
+    // Status-bar-first: only create window if explicitly requested
+    if (task->wantWindow) {
+        EnsureFileOpLogClass();
+        HWND logWnd = CreateFileOpLogWindow(task);
+        if (!logWnd) {
+            if (task->statusId) StatusOpEnd(task->statusId);
+            delete task;
+            MessageBoxW(g_hwndMain, L"Failed to create file-op log window.", L"File operation", MB_OK);
+            return;
+        }
+        task->hwnd = logWnd;
     }
-    task->hwnd = logWnd;
 
     EnterCriticalSection(&g_fileLock);
     g_fileTasks.push_back(task);
@@ -4179,7 +4377,8 @@ static void StartFileOpTask(FileOpTask* task) {
         if (it != g_fileTasks.end()) g_fileTasks.erase(it);
         LeaveCriticalSection(&g_fileLock);
 
-        if (IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
+        if (task->statusId) StatusOpEnd(task->statusId);
+        if (task->hwnd && IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
         delete task;
 
         MessageBoxW(g_hwndMain, L"Failed to start background file-op thread.", L"File operation", MB_OK);
@@ -4189,18 +4388,36 @@ static void StartFileOpTask(FileOpTask* task) {
     task->hThread = hThread;
 }
 
-static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder) {
-    if (g_clipMode == ClipMode::None || g_clipFiles.empty()) return;
+static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder)
+{
+    if (g_clipMode == ClipMode::None || g_clipFiles.empty()) {
+        // Helps diagnose "different machine / different instance" case
+        StatusBarSetText(L"Paste: nothing to paste (clipboard is per-instance)");
+        return;
+    }
 
     FileOpTask* task = new FileOpTask();
     task->kind = FileOpKind::ClipboardPaste;
     task->clipMode = g_clipMode;
     task->srcFiles = g_clipFiles;
     task->dstFolder = EnsureSlash(dstFolder);
-    task->title = (g_clipMode == ClipMode::Copy) ? L"Paste (Copy)" : L"Paste (Move)";
     task->running = true;
 
-    // consume clipboard immediately (matches your current behavior)
+    // SHOW WINDOW for paste ops (matches your feature #5 expectation)
+    task->wantWindow = false;
+
+    // nicer title
+    if (!task->srcFiles.empty()) {
+        const wchar_t* base = wcsrchr(task->srcFiles[0].c_str(), L'\\');
+        base = base ? base + 1 : task->srcFiles[0].c_str();
+        task->title = (g_clipMode == ClipMode::Copy) ? L"Paste copy: " : L"Paste move: ";
+        task->title += base;
+    }
+    else {
+        task->title = (g_clipMode == ClipMode::Copy) ? L"Paste (Copy)" : L"Paste (Move)";
+    }
+
+    // consume clipboard immediately
     g_clipFiles.clear();
     g_clipMode = ClipMode::None;
 
@@ -5041,6 +5258,8 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         }
 
         switch (w) {
+        case VK_ESCAPE: CancelMostRecentFileOpTask(); return 0;
+
         case VK_RETURN: ActivateSelection(); return 0;
         case VK_LEFT:
         case VK_BACK:   NavigateBack(); return 0;
@@ -5442,7 +5661,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
 
         // Single-part (simple) mode
         SendMessageW(g_hwndStatus, SB_SIMPLE, TRUE, 0);
-        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"");
+        StatusBarSetText(L"");
 
         InitializeCriticalSection(&g_fileLock);
         INITCOMMONCONTROLSEX icc; icc.dwSize = sizeof(icc);
@@ -5578,7 +5797,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
     case WM_APP_FILEOP_OUTPUT: {
         FileOpTask* task = (FileOpTask*)w;
         std::wstring* p = (std::wstring*)l;
-        if (task && task->hEdit && p) {
+        if (task && task->hEdit && IsWindow(task->hEdit) && p) {
             HWND edit = task->hEdit;
             SendMessageW(edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
             SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)p->c_str());
@@ -5592,64 +5811,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_APP_FILEOP_DONE: {
-        FileOpTask* task = (FileOpTask*)w;
-        DWORD rc = (DWORD)l;
-
-        // Close thread handle
-        if (task && task->hThread) {
-            CloseHandle(task->hThread);
-            task->hThread = NULL;
-        }
-
-        const bool isPlaybackExitTask = (task && task->fromPlaybackExit);
-        const uint32_t gen = task ? task->playbackExitGen : 0;
-
-        // Auto-close the file-op log window on success
-        if (task && rc == 0) {
-            if (task->hwnd && IsWindow(task->hwnd)) {
-                DestroyWindow(task->hwnd);
-            }
-            task->hwnd = NULL;
-            task->hEdit = NULL;
-            task->hCancel = NULL;
-
-            // Remove + delete successful tasks so they don't pile up
-            EnterCriticalSection(&g_fileLock);
-            auto it = std::find(g_fileTasks.begin(), g_fileTasks.end(), task);
-            if (it != g_fileTasks.end()) g_fileTasks.erase(it);
-            LeaveCriticalSection(&g_fileLock);
-
-            delete task;
-            task = NULL;
-        }
-
-        // If this was part of the playback-exit batch, count it down
-        if (isPlaybackExitTask && gen != 0 && gen == g_pbExitBatchActive) {
-            if (g_pbExitPending > 0) --g_pbExitPending;
-
-            if (g_pbExitPending <= 0 && g_pbExitWantsReload) {
-                // Only reload if user is still on the same folder
-                if (!g_inPlayback &&
-                    g_view == ViewKind::Folder &&
-                    _wcsicmp(g_folder.c_str(), g_pbExitFolder.c_str()) == 0)
-                {
-                    StartBackgroundFolderReload(g_pbExitFolder);
-                }
-
-                // Clear batch state
-                g_pbExitWantsReload = false;
-                g_pbExitBatchActive = 0;
-                g_pbExitPending = 0;
-                g_pbExitFolder.clear();
-            }
-        }
-
-        // For playback-exit tasks, do NOT do expensive foreground refresh.
-        // For normal tasks, keep existing behavior.
-        if (!g_inPlayback && !isPlaybackExitTask) {
-            RefreshCurrentView();
-        }
-
+        OnFileOpDone((FileOpTask*)w, (DWORD)l);
         return 0;
     }
 
