@@ -88,6 +88,7 @@ xcopy /E /I /Y /D "C:\test\media_explorer\vlclib\plugins" "$(OutDir)plugins\"
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="MediaExplorer.cpp" />
+    <ClCompile Include="sqlite3.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

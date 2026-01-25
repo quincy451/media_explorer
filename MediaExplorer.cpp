@@ -37,6 +37,7 @@
 #include <propkey.h>
 #include <wrl/client.h>
 
+
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -117,21 +118,18 @@ std::vector<Row> g_rows;
 
 struct FolderReloadResult {
     uint32_t gen = 0;
-    std::wstring folder;            // ends with '\'
+    std::wstring folder;
     int sortCol = 0;
     bool sortAsc = true;
-    std::vector<Row>* rows = nullptr; // heap; main thread owns
+    std::vector<Row>* rows = nullptr;
+
+    bool scanOk = false;     // NEW
+    DWORD winErr = 0;        // NEW (optional)
 };
 
 std::atomic<uint32_t> g_folderReloadGen{ 0 };
 
 // Playback-exit batching for file-op tasks (NEW)
-// We only use this to wait until *playback-exit* file ops complete before kicking a background reload.
-static uint32_t     g_pbExitBatchCounter = 0;
-static uint32_t     g_pbExitBatchActive = 0;
-static long         g_pbExitPending = 0;
-static std::wstring g_pbExitFolder;          // ends with '\'
-static bool         g_pbExitWantsReload = false;
 
 static bool g_loadingFolder = false;
 
@@ -224,6 +222,9 @@ const UINT_PTR kTimerPlaybackUI = 1;
 enum class ActionType { DeleteFile, RenameFile, CopyToPath };
 struct PostAction { ActionType type; std::wstring src; std::wstring param; };
 std::vector<PostAction> g_post;
+// Files created during playback-exit finalization (e.g., FFmpeg outputs moved back to folder)
+static std::vector<std::wstring> g_newFilesFromPlayback;
+
 
 // filename clipboard for browser
 enum class ClipMode { None, Copy, Move };
@@ -427,7 +428,6 @@ struct FileOpTask {
 
     // NEW: identify tasks that were scheduled by playback exit
     bool     fromPlaybackExit = false;
-    uint32_t playbackExitGen = 0;
 
     FileOpKind kind = FileOpKind::ClipboardPaste;
 
@@ -483,58 +483,62 @@ static std::string NowUtcIso8601() {
     
 }
 
-static void BuildTopazJobJsonUtf8(const std::wstring & originalFull,
-    const std::wstring & queuedFileNameOnly,
-    const TopazJobOptions & opt,
-    std::string & outUtf8)
-     {
+static void BuildTopazJobJsonUtf8(const std::wstring& originalFull,
+    const std::wstring& queuedFileNameOnly,
+    const TopazJobOptions& opt,
+    std::string& outUtf8)
+{
     const int w = (opt.target == TopazTarget::K8) ? 7680 : 3840;
     const int h = (opt.target == TopazTarget::K8) ? 4320 : 2160;
-    
-        auto profileName = [&]() -> const char* {
+
+    auto profileName = [&]() -> const char* {
         switch (opt.profile) {
-        case TopazProfile::General: return "general";
-        case TopazProfile::Repair: return "repair";
-        case TopazProfile::Stabilize: return "stabilize";
-        case TopazProfile::Deblur: return "deblur";
-        case TopazProfile::Denoise: return "denoise";
+        case TopazProfile::General:           return "general";
+        case TopazProfile::Repair:            return "repair";
+        case TopazProfile::Stabilize:         return "stabilize";
+        case TopazProfile::Deblur:            return "deblur";
+        case TopazProfile::Denoise:           return "denoise";
         case TopazProfile::DeinterlaceRepair: return "deinterlace_repair";
-        case TopazProfile::Repair2Pass: return "repair_2pass";
-        case TopazProfile::GeneralGrain: return "general_grain";
-        case TopazProfile::RepairGrain: return "repair_grain";
-        default: return "general";
-                
+        case TopazProfile::Repair2Pass:       return "repair_2pass";
+        case TopazProfile::GeneralGrain:      return "general_grain";
+        case TopazProfile::RepairGrain:       return "repair_grain";
+        default:                              return "general";
         }
-     };
-    
-     std::string orig = JsonEscapeUtf8(ToUtf8(originalFull));
-     std::string inFile = JsonEscapeUtf8(ToUtf8(queuedFileNameOnly));
-    
-     char wh[64]; sprintf_s(wh, "%d", w);
-     char hh[64]; sprintf_s(hh, "%d", h);
-    
-     char grainBuf[64]; sprintf_s(grainBuf, "%.6f", opt.grain);
-     char gsizeBuf[32]; sprintf_s(gsizeBuf, "%d", opt.gsize);
-    
-     std::string t = (opt.target == TopazTarget::K8) ? "8k" : "4k";
-     std::string utc = NowUtcIso8601();
-    
-     std::ostringstream oss;
-     oss
-         << "{\n"
-         << "  \"job_version\": 1,\n"
-         << "  \"submitted_utc\": \"" << utc << "\",\n"
-         << "  \"source_original\": \"" << orig << "\",\n"
-         << "  \"input_file\": \"" << inFile << "\",\n"
-         << "  \"target\": \"" << t << "\",\n"
-         << "  \"target_w\": " << wh << ",\n"
-         << "  \"target_h\": " << hh << ",\n"
-         << "  \"profile\": \"" << profileName() << "\",\n"
-         << "  \"grain\": " << grainBuf << ",\n"
-         << "  \"gsize\": " << gsizeBuf << "\n"
-         << "}\n";
-    
-     outUtf8 = oss.str();
+        };
+
+    const char* targetStr = (opt.target == TopazTarget::K8) ? "8k" : "4k";
+    const char* codecStr = (opt.target == TopazTarget::K8) ? "av1" : "h264";
+    const char* contStr = "mp4";
+
+    std::string orig = JsonEscapeUtf8(ToUtf8(originalFull));
+    std::string inFile = JsonEscapeUtf8(ToUtf8(queuedFileNameOnly));
+
+    char wh[64]; sprintf_s(wh, "%d", w);
+    char hh[64]; sprintf_s(hh, "%d", h);
+
+    char grainBuf[64]; sprintf_s(grainBuf, "%.6f", opt.grain);
+    char gsizeBuf[32]; sprintf_s(gsizeBuf, "%d", opt.gsize);
+
+    std::string utc = NowUtcIso8601();
+
+    std::ostringstream oss;
+    oss
+        << "{\n"
+        << "  \"job_version\": 1,\n"
+        << "  \"submitted_utc\": \"" << utc << "\",\n"
+        << "  \"source_original\": \"" << orig << "\",\n"
+        << "  \"input_file\": \"" << inFile << "\",\n"
+        << "  \"target\": \"" << targetStr << "\",\n"
+        << "  \"target_w\": " << wh << ",\n"
+        << "  \"target_h\": " << hh << ",\n"
+        << "  \"codec\": \"" << codecStr << "\",\n"
+        << "  \"container\": \"" << contStr << "\",\n"
+        << "  \"profile\": \"" << profileName() << "\",\n"
+        << "  \"grain\": " << grainBuf << ",\n"
+        << "  \"gsize\": " << gsizeBuf << "\n"
+        << "}\n";
+
+    outUtf8 = oss.str();
 }
 
 
@@ -563,14 +567,12 @@ static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder);
 
 static void ScheduleDeleteFilesAsync(const std::vector<std::wstring>& files,
     const std::wstring& title,
-    bool fromPlaybackExit = false,
-    uint32_t playbackExitGen = 0);
+    bool fromPlaybackExit = false);
 
 static void ScheduleCopyToPathAsync(const std::wstring& src,
     const std::wstring& dst,
     const std::wstring& title,
-    bool fromPlaybackExit = false,
-    uint32_t playbackExitGen = 0);
+    bool fromPlaybackExit = false);
 
 static void RefreshCurrentView();
 
@@ -1344,6 +1346,7 @@ static std::string ToUtf8(const std::wstring& ws) {
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], n, NULL, NULL);
     return s;
 }
+
 static std::wstring ExtLower(const std::wstring& p) {
     size_t dot = p.find_last_of(L'.'); if (dot == std::wstring::npos) return L"";
     std::wstring e = p.substr(dot); std::transform(e.begin(), e.end(), e.begin(), ::towlower); return e;
@@ -2085,12 +2088,14 @@ static void SortRowsVector(std::vector<Row>& rows, int col, bool asc) {
         });
 }
 
-static void BuildFolderRowsForReload(const std::wstring& folder,
+static bool BuildFolderRowsForReload(const std::wstring& folder,
     std::vector<Row>& out,
     uint32_t myGen,
     int sortCol,
-    bool sortAsc)
+    bool sortAsc,
+    DWORD& outWinErr)
 {
+    outWinErr = 0;
     out.clear();
     std::wstring abs = EnsureSlash(folder);
 
@@ -2102,11 +2107,16 @@ static void BuildFolderRowsForReload(const std::wstring& folder,
         NULL,
         FIND_FIRST_EX_LARGE_FETCH);
 
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) {
+        outWinErr = GetLastError();
+        return false;
+    }
 
+    bool cancelled = false;
     std::vector<Row> dirs, vids;
+
     do {
-        if (myGen != g_folderReloadGen.load(std::memory_order_relaxed)) break;
+        if (myGen != g_folderReloadGen.load(std::memory_order_relaxed)) { cancelled = true; break; }
 
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
@@ -2136,11 +2146,17 @@ static void BuildFolderRowsForReload(const std::wstring& folder,
 
     FindClose(h);
 
+    if (cancelled) {
+        out.clear();
+        return false;
+    }
+
     out.reserve(dirs.size() + vids.size());
     out.insert(out.end(), dirs.begin(), dirs.end());
     out.insert(out.end(), vids.begin(), vids.end());
 
     SortRowsVector(out, sortCol, sortAsc);
+    return true;
 }
 
 static DWORD WINAPI FolderReloadThreadProc(LPVOID param) {
@@ -2155,11 +2171,14 @@ static DWORD WINAPI FolderReloadThreadProc(LPVOID param) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     std::vector<Row>* rows = new std::vector<Row>();
-    BuildFolderRowsForReload(f, *rows, myGen, sortCol, sortAsc);
+    DWORD winErr = 0;
+    bool ok = BuildFolderRowsForReload(f, *rows, myGen, sortCol, sortAsc, winErr);
 
     CoUninitialize();
 
     res->rows = rows;
+    res->scanOk = ok;
+    res->winErr = winErr;
 
     HWND hwnd = g_hwndMain;
     if (hwnd && IsWindow(hwnd)) {
@@ -2285,34 +2304,28 @@ static void ShowDrives() {
 }
 
 static void ShowFolder(std::wstring abs) {
-    CancelBackgroundFolderReload(); // NEW
+    CancelBackgroundFolderReload();
     CancelMetaWorkAndClearTodo();
 
     if (abs.size() == 2 && abs[1] == L':') abs += L'\\';
     abs = EnsureSlash(abs);
+
     g_view = ViewKind::Folder;
     g_folder = abs;
     g_rows.clear();
 
-    // ------------------------------------------------------------
-    // NEW: set title immediately + prepare 1-char busy animation
-    // Sequence: ' ' '.' 'o' 'O' ' ' ...
-    // ------------------------------------------------------------
-    std::wstring animTitle = L"Media Explorer - ";
-    animTitle += EnsureSlash(g_folder);   // should already have trailing '\'
-    animTitle.push_back(L' ');            // start on SPC (0x20)
+    g_loadingFolder = true;
 
-    SetWindowTextW(g_hwndMain, animTitle.c_str());
-    UpdateWindow(g_hwndMain);             // force the change to show ASAP
-
-    static const wchar_t kAnimFrames[4] = { L' ', L'.', L'o', L'O' };
-    DWORD lastAnimTick = GetTickCount();
-    int   animFrame = 1;                  // after ~1 second show '.' first
+    // Title spinner
+    std::wstring animTitle;
+    DWORD lastAnimTick = 0;
+    int animFrame = 0;
+    BeginFolderLoadTitle(g_folder, animTitle, lastAnimTick, animFrame);
 
     SendMessageW(g_hwndList, WM_SETREDRAW, FALSE, 0);
     LV_ResetColumns();
 
-    WIN32_FIND_DATAW fd; ZeroMemory(&fd, sizeof(fd));
+    WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileExW((abs + L"*").c_str(),
         FindExInfoBasic,
         &fd,
@@ -2323,65 +2336,58 @@ static void ShowFolder(std::wstring abs) {
     if (h == INVALID_HANDLE_VALUE) {
         SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(g_hwndList, NULL, TRUE);
-
-        // End cleanly (no spinner char left behind)
         SetTitleFolderOrDrives();
+        g_loadingFolder = false;
         return;
     }
 
     std::vector<Row> dirs, vids;
+
     do {
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-        Row r; r.name = fd.cFileName; r.full = abs + fd.cFileName;
+        Row r;
+        r.name = fd.cFileName;
+        r.full = abs + fd.cFileName;
         r.isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         r.modified = fd.ftLastWriteTime;
 
         if (r.isDir) {
             r.full += L'\\';
-            dirs.push_back(r);
+            dirs.push_back(std::move(r));
         }
         else if (IsVideoFile(r.full)) {
-            ULARGE_INTEGER uli; uli.HighPart = fd.nFileSizeHigh; uli.LowPart = fd.nFileSizeLow;
+            ULARGE_INTEGER uli{};
+            uli.HighPart = fd.nFileSizeHigh;
+            uli.LowPart = fd.nFileSizeLow;
             r.size = uli.QuadPart;
 
-            // FAST cached try first (cheap)
             if (!GetVideoPropsFastCached(r.full, r.vW, r.vH, r.vDur100ns)) {
-                r.vW = r.vH = 0; r.vDur100ns = 0; // mark for async
+                r.vW = r.vH = 0;
+                r.vDur100ns = 0;
             }
-            vids.push_back(r);
+            vids.push_back(std::move(r));
         }
 
-        // ------------------------------------------------------------
-        // NEW: pump messages + update 1-char spinner once per second
-        // ------------------------------------------------------------
-        PumpMessagesThrottled(50); // keeps app responsive (prevents "Not Responding")
-
-        DWORD now = GetTickCount();
-        if (now - lastAnimTick >= 1000) {
-            animTitle.back() = kAnimFrames[animFrame & 3];
-            ++animFrame;
-            SetWindowTextW(g_hwndMain, animTitle.c_str());
-            lastAnimTick = now;
-        }
+        TickFolderLoadTitle(animTitle, lastAnimTick, animFrame);
 
     } while (FindNextFileW(h, &fd));
+
     FindClose(h);
 
     g_rows.reserve(dirs.size() + vids.size());
     g_rows.insert(g_rows.end(), dirs.begin(), dirs.end());
     g_rows.insert(g_rows.end(), vids.begin(), vids.end());
 
+    // Keep your existing sort behavior on folder loads
     SortRows(g_sortCol, g_sortAsc);
 
     SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_hwndList, NULL, TRUE);
 
-    // Queue remaining metadata and kick worker
     QueueMissingPropsAndKickWorker();
-
-    // End cleanly on space / remove spinner by restoring normal title
     SetTitleFolderOrDrives();
+    g_loadingFolder = false;
 }
 
 // ----------------------------- Search (recursive, case-insensitive, AND terms)
@@ -2563,6 +2569,87 @@ static std::wstring UniqueName(const std::wstring& folder, const std::wstring& b
         if (!PathFileExistsW(t.c_str())) return t;
     }
     return target;
+}
+
+static std::wstring BaseNameOnly(const std::wstring& path) {
+    const wchar_t* base = wcsrchr(path.c_str(), L'\\');
+    return base ? std::wstring(base + 1) : path;
+}
+
+static std::wstring FolderOfFileWithSlash(const std::wstring& path) {
+    std::vector<wchar_t> buf(path.begin(), path.end());
+    buf.push_back(L'\0');
+    PathRemoveFileSpecW(buf.data());
+    return EnsureSlash(std::wstring(buf.data()));
+}
+
+static bool BuildVideoRowForPath(const std::wstring& fullPath, bool forSearch, Row& out) {
+    if (!IsVideoFile(fullPath)) return false;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(fullPath.c_str(), GetFileExInfoStandard, &fad)) return false;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;
+
+    Row r;
+    r.isDir = false;
+    r.full = fullPath;
+    r.name = forSearch ? fullPath : BaseNameOnly(fullPath);
+    r.modified = fad.ftLastWriteTime;
+
+    ULARGE_INTEGER uli{};
+    uli.HighPart = fad.nFileSizeHigh;
+    uli.LowPart = fad.nFileSizeLow;
+    r.size = uli.QuadPart;
+
+    GetVideoPropsFastCached(r.full, r.vW, r.vH, r.vDur100ns);
+    out = std::move(r);
+    return true;
+}
+
+static void RemoveFileFromCurrentView(const std::wstring& fullPath) {
+    for (int i = (int)g_rows.size() - 1; i >= 0; --i) {
+        if (!g_rows[i].isDir && _wcsicmp(g_rows[i].full.c_str(), fullPath.c_str()) == 0) {
+            g_rows.erase(g_rows.begin() + i);
+            ListView_DeleteItem(g_hwndList, i);
+        }
+    }
+}
+
+static void UpdateRenamedFileInCurrentView(const std::wstring& oldPath, const std::wstring& newPath) {
+    // If we’re in Folder view and the file was moved out of this folder, remove it
+    if (g_view == ViewKind::Folder) {
+        std::wstring newFolder = FolderOfFileWithSlash(newPath);
+        if (_wcsicmp(newFolder.c_str(), g_folder.c_str()) != 0) {
+            RemoveFileFromCurrentView(oldPath);
+            return;
+        }
+    }
+
+    for (int i = 0; i < (int)g_rows.size(); ++i) {
+        Row& r = g_rows[i];
+        if (!r.isDir && _wcsicmp(r.full.c_str(), oldPath.c_str()) == 0) {
+            r.full = newPath;
+            r.name = (g_view == ViewKind::Search) ? newPath : BaseNameOnly(newPath);
+
+            // refresh size/mtime
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExW(newPath.c_str(), GetFileExInfoStandard, &fad)) {
+                r.modified = fad.ftLastWriteTime;
+                ULARGE_INTEGER uli{};
+                uli.HighPart = fad.nFileSizeHigh;
+                uli.LowPart = fad.nFileSizeLow;
+                r.size = uli.QuadPart;
+            }
+
+            // keep existing props if present; else try fast cached
+            if (r.vW == 0 && r.vH == 0 && r.vDur100ns == 0) {
+                GetVideoPropsFastCached(r.full, r.vW, r.vH, r.vDur100ns);
+            }
+
+            LV_UpdateRow(i, r);
+            return;
+        }
+    }
 }
 
 // ----------------------------- DPI helpers
@@ -3319,63 +3406,69 @@ static bool PromptKeyword(std::wstring& out) {
 }
 
 // ----------------------------- Playback
-static void ApplyPostActionsAndRefresh(bool hadFfmpegTasks) {
-    // We no longer rebuild the folder/search view here.
-    // We return immediately to the existing list (cached), then (optionally)
-    // do a background reload once playback-exit file ops finish.
+static void ApplyPostActionsAndRefresh(bool /*hadFfmpegTasks*/) {
+    if (g_view == ViewKind::Drives) {
+        g_post.clear();
+        g_newFilesFromPlayback.clear();
+        return;
+    }
 
-    const bool inFolderView = (g_view == ViewKind::Folder && !g_folder.empty());
-    int fileOpsScheduled = 0;
+    // Patch the existing in-memory list and ListView in-place.
+    SendMessageW(g_hwndList, WM_SETREDRAW, FALSE, 0);
 
-    // Count how many background file ops we will schedule (DeleteFile + CopyToPath)
+    // 1) Add any FFmpeg outputs created during playback
+    if (!g_newFilesFromPlayback.empty()) {
+        for (const auto& p : g_newFilesFromPlayback) {
+            // Only auto-add in Folder view for the current folder
+            if (g_view != ViewKind::Folder) continue;
+            if (_wcsicmp(FolderOfFileWithSlash(p).c_str(), g_folder.c_str()) != 0) continue;
+
+            // avoid duplicates
+            bool exists = false;
+            for (const auto& r : g_rows) {
+                if (!r.isDir && _wcsicmp(r.full.c_str(), p.c_str()) == 0) { exists = true; break; }
+            }
+            if (exists) continue;
+
+            Row nr;
+            if (BuildVideoRowForPath(p, false, nr)) {
+                int idx = (int)g_rows.size();
+                g_rows.push_back(std::move(nr));
+                LV_Add(idx, g_rows[idx]);
+            }
+        }
+        g_newFilesFromPlayback.clear();
+    }
+
+    // 2) Apply queued post actions (delete/rename/copy)
     for (const auto& a : g_post) {
-        if (a.type == ActionType::DeleteFile) ++fileOpsScheduled;
-        else if (a.type == ActionType::CopyToPath) ++fileOpsScheduled;
-        // RenameFile is synchronous (MoveFileEx) in your current design
-    }
-
-    // Decide if we want a folder reload at all:
-    // - Only for Folder view
-    // - Only if something likely changed (ffmpeg ran, rename ran, or we scheduled playback-exit file ops)
-    bool wantsFolderReload = inFolderView && (hadFfmpegTasks || fileOpsScheduled > 0);
-
-    // If we scheduled file ops, we wait for them to finish before background reload.
-    uint32_t batchGen = 0;
-    if (wantsFolderReload && fileOpsScheduled > 0) {
-        g_pbExitBatchActive = ++g_pbExitBatchCounter;
-        g_pbExitPending = fileOpsScheduled;
-        g_pbExitFolder = g_folder;
-        g_pbExitWantsReload = true;
-        batchGen = g_pbExitBatchActive;
-    }
-
-    // Run post actions:
-    for (size_t i = 0; i < g_post.size(); ++i) {
-        const PostAction& a = g_post[i];
         switch (a.type) {
         case ActionType::DeleteFile: {
-            std::vector<std::wstring> one{ a.src };
+            // remove from view immediately
+            RemoveFileFromCurrentView(a.src);
 
+            std::vector<std::wstring> one{ a.src };
             const wchar_t* base = wcsrchr(a.src.c_str(), L'\\');
             base = base ? base + 1 : a.src.c_str();
 
             std::wstring title = L"Delete: ";
             title += base;
 
-            // Mark as playback-exit so WM_APP_FILEOP_DONE won't do an expensive foreground refresh.
-            ScheduleDeleteFilesAsync(one, title, true, batchGen);
+            // still do the actual delete async, but don’t trigger a reload
+            ScheduleDeleteFilesAsync(one, title, true);
             break;
         }
         case ActionType::RenameFile: {
-            // Synchronous (as you already do)
             BOOL ok = MoveFileExW(a.src.c_str(), a.param.c_str(),
                 MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING);
             DWORD err = ok ? 0 : GetLastError();
+
             LogLine(L"PostAction RenameFile: src=\"%s\" dst=\"%s\" %s err=%lu",
                 a.src.c_str(), a.param.c_str(), ok ? L"OK" : L"FAILED", err);
 
-            // A rename changes the folder; we want a reload if we're in folder view.
-            if (inFolderView) wantsFolderReload = true;
+            if (ok) {
+                UpdateRenamedFileInCurrentView(a.src, a.param);
+            }
             break;
         }
         case ActionType::CopyToPath: {
@@ -3385,22 +3478,17 @@ static void ApplyPostActionsAndRefresh(bool hadFfmpegTasks) {
             std::wstring title = L"Copy: ";
             title += base;
 
-            // Mark as playback-exit so WM_APP_FILEOP_DONE won't do an expensive foreground refresh.
-            ScheduleCopyToPathAsync(a.src, a.param, title, true, batchGen);
+            // async copy; we don’t add it to the list unless it lands in this folder (optional later)
+            ScheduleCopyToPathAsync(a.src, a.param, title, true);
             break;
         }
         }
     }
+
     g_post.clear();
 
-    // If we want a folder reload but did NOT schedule any async file ops,
-    // do it immediately in the background (still only if we're still on same folder later).
-    if (wantsFolderReload && fileOpsScheduled == 0) {
-        StartBackgroundFolderReload(g_folder);
-    }
-
-    // IMPORTANT: Do NOT call ShowFolder / ShowSearchResults here.
-    // That is what was causing the slow, synchronous disk rebuild on ESC.
+    SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_hwndList, NULL, TRUE);
 }
 
 static void PlayIndex(size_t idx) {
@@ -3485,8 +3573,18 @@ static void FinalizeAllFfmpegTasks() {
             _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
 
             std::wstring dst = UniqueName(parent, fname, ext);
-            MoveFileExW(src.c_str(), dst.c_str(),
-                MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING);
+            if (MoveFileExW(src.c_str(), dst.c_str(),
+                MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING))
+            {
+                // record so we can add it to the in-memory list after playback
+                g_newFilesFromPlayback.push_back(dst);
+            }
+            else
+            {
+                DWORD err = GetLastError();
+                LogLine(L"FinalizeAllFfmpegTasks: MoveFileEx failed src=\"%s\" dst=\"%s\" err=%lu",
+                    src.c_str(), dst.c_str(), err);
+            }
         }
 
         // Collect workingDir for later deletion
@@ -3575,6 +3673,8 @@ static void WaitForFfmpegTasksAndFinalize() {
 static void ExitPlayback() {
     LogLine(L"ExitPlayback called: inPlayback=%d", g_inPlayback ? 1 : 0);
     if (!g_inPlayback) return;
+
+    g_newFilesFromPlayback.clear();
 
     if (g_fullscreen) ToggleFullscreen();
     KillTimer(g_hwndMain, kTimerPlaybackUI);
@@ -3969,7 +4069,6 @@ static void OnFileOpDone(FileOpTask* task, DWORD rc)
     }
 
     const bool isPlaybackExitTask = task->fromPlaybackExit;
-    const uint32_t gen = task->playbackExitGen;
 
     // End status-bar op
     if (task->statusId) {
@@ -4016,24 +4115,6 @@ static void OnFileOpDone(FileOpTask* task, DWORD rc)
         task = nullptr;
     }
 
-    // Playback-exit batch countdown logic (your existing behavior)
-    if (isPlaybackExitTask && gen != 0 && gen == g_pbExitBatchActive) {
-        if (g_pbExitPending > 0) --g_pbExitPending;
-
-        if (g_pbExitPending <= 0 && g_pbExitWantsReload) {
-            if (!g_inPlayback &&
-                g_view == ViewKind::Folder &&
-                _wcsicmp(g_folder.c_str(), g_pbExitFolder.c_str()) == 0)
-            {
-                StartBackgroundFolderReload(g_pbExitFolder);
-            }
-
-            g_pbExitWantsReload = false;
-            g_pbExitBatchActive = 0;
-            g_pbExitPending = 0;
-            g_pbExitFolder.clear();
-        }
-    }
 
     // Normal tasks refresh the view when not in playback
     if (!g_inPlayback && !isPlaybackExitTask) {
@@ -4426,10 +4507,10 @@ static void ScheduleClipboardPasteAsync(const std::wstring& dstFolder)
 
 static void ScheduleDeleteFilesAsync(const std::vector<std::wstring>& files,
     const std::wstring& title,
-    bool fromPlaybackExit,
-    uint32_t playbackExitGen)
+    bool fromPlaybackExit)
 {
     if (files.empty()) return;
+
     FileOpTask* task = new FileOpTask();
     task->kind = FileOpKind::DeleteFiles;
     task->srcFiles = files;
@@ -4437,19 +4518,17 @@ static void ScheduleDeleteFilesAsync(const std::vector<std::wstring>& files,
     task->running = true;
 
     task->fromPlaybackExit = fromPlaybackExit;
-    task->playbackExitGen = playbackExitGen;
 
     StartFileOpTask(task);
 }
 
-
 static void ScheduleCopyToPathAsync(const std::wstring& src,
     const std::wstring& dst,
     const std::wstring& title,
-    bool fromPlaybackExit,
-    uint32_t playbackExitGen)
+    bool fromPlaybackExit)
 {
     if (src.empty() || dst.empty()) return;
+
     FileOpTask* task = new FileOpTask();
     task->kind = FileOpKind::CopyToPath;
     task->srcSingle = src;
@@ -4458,7 +4537,6 @@ static void ScheduleCopyToPathAsync(const std::wstring& src,
     task->running = true;
 
     task->fromPlaybackExit = fromPlaybackExit;
-    task->playbackExitGen = playbackExitGen;
 
     StartFileOpTask(task);
 }
@@ -5828,12 +5906,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
             (g_view == ViewKind::Folder) &&
             (_wcsicmp(g_folder.c_str(), folder.c_str()) == 0);
 
-        if (accept && res->rows) {
+        if (accept && res->rows && res->scanOk) {
             CancelMetaWorkAndClearTodo();
 
             g_rows.swap(*res->rows);
 
-            // If the user changed sort while reload was running, re-sort to current.
             if (g_sortCol != res->sortCol || g_sortAsc != res->sortAsc) {
                 SortRowsVector(g_rows, g_sortCol, g_sortAsc);
             }
@@ -5846,6 +5923,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
 
             QueueMissingPropsAndKickWorker();
             SetTitleFolderOrDrives();
+
+
+        }
+        else if (accept && (!res->scanOk)) {
+            // Reload failed -> keep whatever is on screen (often cache)
+            // Optional: StatusBarSetText(L"Folder refresh failed; showing cached list");
+            if (g_cfg.loggingEnabled) {
+                LogLine(L"Folder reload failed: \"%s\" err=%lu", folder.c_str(), (unsigned long)res->winErr);
+            }
         }
 
         if (res->rows) delete res->rows;
@@ -6075,6 +6161,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
         if (g_mp) { libvlc_media_player_stop(g_mp); libvlc_media_player_release(g_mp); g_mp = NULL; }
         if (g_vlc) { libvlc_release(g_vlc); g_vlc = NULL; }
 
+
         PostQuitMessage(0);
         return 0;
     } // end switch (m)
@@ -6094,6 +6181,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     }
 
     LoadConfigFromIni();
+
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
