@@ -228,8 +228,10 @@ float g_videoPanStartNormY = 0.5f;
 HHOOK g_playbackMouseHook = NULL;
 unsigned g_videoSourceW = 0;
 unsigned g_videoSourceH = 0;
+int g_videoLayoutWarmupTicks = 0;
 // timers
 const UINT_PTR kTimerPlaybackUI = 1;
+const int kVideoLayoutWarmupTicks = 15;
 
 // post-playback actions
 enum class ActionType { DeleteFile, RenameFile, CopyToPath };
@@ -4022,7 +4024,15 @@ static void CenterVideoPan() {
 
 static void PlayIndex(size_t idx) {
     if (!g_vlc) {
-        const char* args[] = { g_vlcHwArgA.c_str(), "--no-video-title-show" };
+        // Keep libVLC isolated from persisted VLC preferences so renderer diagnostics
+        // and other OSD-style overlays cannot bleed into the embedded player.
+        const char* args[] = {
+            g_vlcHwArgA.c_str(),
+            "--ignore-config",
+            "--no-video-title-show",
+            "--no-osd",
+            "--no-stats",
+        };
         g_vlc = libvlc_new((int)(sizeof(args) / sizeof(args[0])), args);
         g_mp = libvlc_media_player_new(g_vlc);
         libvlc_media_player_set_hwnd(g_mp, g_hwndVideoSurface);
@@ -4037,6 +4047,7 @@ static void PlayIndex(size_t idx) {
     }
 
     ResetVideoZoom();
+    g_videoLayoutWarmupTicks = kVideoLayoutWarmupTicks;
     g_playlistIndex = idx;
     g_lastLenForRange = -1;
     SendMessageW(g_hwndSeek, TBM_SETRANGEMAX, TRUE, 0);
@@ -6581,11 +6592,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
                 libvlc_time_t p = cur; if (p > INT_MAX) p = INT_MAX;
                 SendMessageW(g_hwndSeek, TBM_SETPOS, TRUE, (LPARAM)p);
             }
-            if (g_videoZoomMultiplier > 1.001f) {
-                ApplyVideoZoom();
-            }
-            else if (g_videoSourceW == 0 || g_videoSourceH == 0) {
-                if (RefreshVideoSourceSize()) ApplyVideoZoom();
+            bool haveVideoSource = (g_videoSourceW != 0 && g_videoSourceH != 0);
+            if (!haveVideoSource) haveVideoSource = RefreshVideoSourceSize();
+
+            if (haveVideoSource) {
+                if (g_videoZoomMultiplier > 1.001f || g_videoLayoutWarmupTicks > 0) {
+                    ApplyVideoZoom();
+                    if (g_videoLayoutWarmupTicks > 0) --g_videoLayoutWarmupTicks;
+                }
             }
             SetTitlePlaying();
             return 0;
