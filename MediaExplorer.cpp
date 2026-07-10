@@ -74,6 +74,7 @@
 #include <vlc/vlc.h>
 
 #define IDC_STATUSBAR  5001
+#define IDM_LIST_NEW_FOLDER 6001
 
 
 #ifndef FIND_FIRST_EX_LARGE_FETCH
@@ -188,11 +189,17 @@ static bool GetPersistentMappedRemotePath(wchar_t letter, std::wstring& outRemot
 
 
 static std::wstring QuoteArg(const std::wstring & s) {
-        // Simple Windows quoting (good enough for paths); we assume no embedded quotes in paths.
-        if (s.empty()) return L"\"\"";
-    if (s.find_first_of(L" \t") == std::wstring::npos) return s;
-    return L"\"" + s + L"\"";
-    
+    // Quote paths that cmd.exe would otherwise split or interpret.
+    if (s.empty()) return L"\"\"";
+    if (s.find_first_of(L" \t&()[]{}^=;!'+,`~|<>+") == std::wstring::npos) return s;
+
+    std::wstring out = L"\"";
+    for (wchar_t ch : s) {
+        if (ch == L'"') out += L'\\';
+        out += ch;
+    }
+    out += L"\"";
+    return out;
 }
 
 static bool DirExistsW(const std::wstring & p) {
@@ -852,16 +859,26 @@ struct CombineTask {
     std::vector<std::wstring> srcFiles;      // original source file paths
     std::wstring combinedFull;  // final combined video path
     std::wstring title;         // short description (e.g., output file name)
+    std::wstring pendingJsonPath;
+    std::vector<std::wstring> pendingCommands;
     bool   running;
-    bool   hiddenByPlayback;    // <--- NEW
+    bool   hiddenByPlayback;
 
     CombineTask() :
         hThread(NULL),
         hProcess(NULL),
         hwnd(NULL),
         hEdit(NULL),
-        running(false) {
+        running(false),
+        hiddenByPlayback(false) {
     }
+};
+
+struct PendingCombineJobFile {
+    std::wstring title;
+    std::wstring workingDir;
+    std::wstring combinedFull;
+    std::vector<std::wstring> commands;
 };
 
 CRITICAL_SECTION g_combineLock;
@@ -1178,7 +1195,7 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
         }
     }
 
-    // Paths should already be filled in, but ensure they’re non-empty.
+    // Paths should already be filled in, but ensure they're non-empty.
     if (task->inputCopy.empty() || task->outputTemp.empty()) {
         PostFfmpegOutput(task, L"ERROR: task paths are not initialized.\r\n");
         task->exitCode = 2;
@@ -1584,6 +1601,14 @@ static std::string ToUtf8(const std::wstring& ws) {
     std::string s(n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], n, NULL, NULL);
     return s;
+}
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring ws(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &ws[0], n);
+    return ws;
 }
 
 static std::wstring ExtLower(const std::wstring& p) {
@@ -2062,6 +2087,7 @@ static void ShowHelp() {
         L"  Enter / Double-click : Open folder / Play selected video(s)\n"
         L"  Left / Backspace     : Up one folder (from root -> drives) / Exit search\n"
         L"  Click column header  : Sort (folders always first)\n"
+        L"  Right-click          : New folder\n"
         L"  Ctrl+A               : Select all videos in current view\n"
         L"  Ctrl+P               : Play selected videos\n"
         L"  Ctrl+F               : Search (recursive). In Search view: refine (AND/intersection)\n"
@@ -2832,6 +2858,71 @@ static std::wstring FolderOfFileWithSlash(const std::wstring& path) {
     return EnsureSlash(std::wstring(buf.data()));
 }
 
+static std::wstring FormatVideoDimensions(int w, int h) {
+    return std::to_wstring(w) + L"x" + std::to_wstring(h);
+}
+
+static bool GetCombineSourceDimensions(const std::wstring& path, int& outW, int& outH) {
+    outW = outH = 0;
+
+    std::wstring videoCodec, audioCodec;
+    if (GetMediaInfoFromFfprobe(path, outW, outH, videoCodec, audioCodec) &&
+        outW > 0 && outH > 0) {
+        return true;
+    }
+
+    ULONGLONG dur = 0;
+    return GetVideoProps(path, outW, outH, dur) && outW > 0 && outH > 0;
+}
+
+static bool ValidateCombineSourceDimensions(const std::vector<std::wstring>& srcFiles,
+    std::wstring& outError)
+{
+    outError.clear();
+    if (srcFiles.size() < 2) return true;
+
+    int expectedW = 0;
+    int expectedH = 0;
+    std::wstring expectedFile;
+
+    for (const auto& path : srcFiles) {
+        int w = 0;
+        int h = 0;
+        if (!GetCombineSourceDimensions(path, w, h)) {
+            outError = L"Cannot combine videos because the app could not read the video resolution for:\n\n";
+            outError += path;
+            outError += L"\n\nThe combine tool needs readable source dimensions before it can safely run.";
+            LogLine(L"Combine rejected: failed to read dimensions for \"%s\"", path.c_str());
+            return false;
+        }
+
+        if (expectedW == 0 && expectedH == 0) {
+            expectedW = w;
+            expectedH = h;
+            expectedFile = path;
+            continue;
+        }
+
+        if (w != expectedW || h != expectedH) {
+            outError = L"Cannot combine videos with different resolutions.\n\n";
+            outError += BaseNameOnly(expectedFile);
+            outError += L": ";
+            outError += FormatVideoDimensions(expectedW, expectedH);
+            outError += L"\n";
+            outError += BaseNameOnly(path);
+            outError += L": ";
+            outError += FormatVideoDimensions(w, h);
+            outError += L"\n\nNormalize the files to the same resolution before combining them.";
+
+            LogLine(L"Combine rejected: resolution mismatch \"%s\"=%dx%d \"%s\"=%dx%d",
+                expectedFile.c_str(), expectedW, expectedH, path.c_str(), w, h);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool BuildVideoRowForPath(const std::wstring& fullPath, bool forSearch, Row& out) {
     if (!IsVideoFile(fullPath)) return false;
 
@@ -2865,7 +2956,7 @@ static void RemoveFileFromCurrentView(const std::wstring& fullPath) {
 }
 
 static void UpdateRenamedFileInCurrentView(const std::wstring& oldPath, const std::wstring& newPath) {
-    // If we’re in Folder view and the file was moved out of this folder, remove it
+    // If we're in Folder view and the file was moved out of this folder, remove it
     if (g_view == ViewKind::Folder) {
         std::wstring newFolder = FolderOfFileWithSlash(newPath);
         if (_wcsicmp(newFolder.c_str(), g_folder.c_str()) != 0) {
@@ -3129,7 +3220,7 @@ static void Browser_PasteClipboardIntoCurrent() {
 static void Browser_DeleteSelected() {
     if (g_view == ViewKind::Drives) return;
 
-    if (MessageBoxW(g_hwndMain, L"Delete selected files permanently?", L"Confirm Delete",
+    if (MessageBoxW(g_hwndMain, L"Delete selected items permanently?", L"Confirm Delete",
         MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
 
     std::vector<std::wstring> doomed;
@@ -3137,11 +3228,11 @@ static void Browser_DeleteSelected() {
     while ((idx = ListView_GetNextItem(g_hwndList, idx, LVNI_SELECTED)) != -1) {
         if (idx < 0 || idx >= (int)g_rows.size()) continue;
         const Row& r = g_rows[idx];
-        if (!r.isDir) doomed.push_back(r.full);
+        doomed.push_back(r.full);
     }
     if (doomed.empty()) return;
 
-    ScheduleDeleteFilesAsync(doomed, L"Delete selected files");
+    ScheduleDeleteFilesAsync(doomed, L"Delete selected items");
 }
 
 // Move a single selected row up or down in the current list.
@@ -3234,6 +3325,604 @@ static bool PromptCombinedOutputName(const std::wstring& baseFolder,
     return true;
 }
 
+static std::wstring GetExecutableDirectory() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(NULL, exePath, MAX_PATH)) return L"";
+    PathRemoveFileSpecW(exePath);
+    return EnsureSlash(std::wstring(exePath));
+}
+
+static std::wstring GetCombinePendingDir() {
+    return GetExecutableDirectory() + L"pending\\";
+}
+
+static bool EnsureDirectoryExistsDeep(const std::wstring& dir) {
+    if (dir.empty()) return false;
+    int rc = SHCreateDirectoryExW(NULL, dir.c_str(), NULL);
+    return rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS || DirExistsW(dir);
+}
+
+static std::wstring SanitizeFileNameComponent(std::wstring s) {
+    if (s.empty()) s = L"combine";
+    for (wchar_t& ch : s) {
+        if (ch < 32 || wcschr(L"<>:\"/\\|?*", ch)) ch = L'_';
+    }
+    return s;
+}
+
+static std::wstring TrimTrailingSlashForCmd(std::wstring path) {
+    while (path.size() > 3 && !path.empty() && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+static void AppendDeleteIfExistsCommand(std::vector<std::wstring>& commands,
+    const std::wstring& targetPath,
+    bool forceDelete)
+{
+    if (targetPath.empty()) return;
+    std::wstring quoted = QuoteArg(targetPath);
+    std::wstring delCmd = forceDelete ? L"del /F /Q " : L"del /Q ";
+    commands.push_back(L"if exist " + quoted + L" (" + delCmd + quoted + L" || exit /b 1) else (ver >nul)");
+}
+
+static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text);
+
+static std::wstring MakePendingCombineJobPath(const std::wstring& title) {
+    std::wstring pendingDir = GetCombinePendingDir();
+    if (!EnsureDirectoryExistsDeep(pendingDir)) return L"";
+
+    std::wstring stem = SanitizeFileNameComponent(title);
+    SYSTEMTIME st{}; GetLocalTime(&st);
+
+    for (int i = 0; i < 1000; ++i) {
+        wchar_t buf[512];
+        swprintf_s(buf, L"%s_%04u%02u%02u_%02u%02u%02u_%03u_%03d.json",
+            stem.c_str(),
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            i);
+        std::wstring full = pendingDir + buf;
+        if (!PathFileExistsW(full.c_str())) return full;
+    }
+
+    return pendingDir + stem + L".json";
+}
+
+static void SkipJsonWs(const std::string& text, size_t& pos) {
+    while (pos < text.size()) {
+        unsigned char ch = (unsigned char)text[pos];
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') ++pos;
+        else break;
+    }
+}
+
+static bool ParseJsonExpected(const std::string& text, size_t& pos, char expected) {
+    SkipJsonWs(text, pos);
+    if (pos >= text.size() || text[pos] != expected) return false;
+    ++pos;
+    return true;
+}
+
+static bool ParseJsonStringToken(const std::string& text, size_t& pos, std::string& out) {
+    SkipJsonWs(text, pos);
+    if (pos >= text.size() || text[pos] != '"') return false;
+    ++pos;
+    out.clear();
+
+    while (pos < text.size()) {
+        char ch = text[pos++];
+        if (ch == '"') return true;
+        if (ch == '\\') {
+            if (pos >= text.size()) return false;
+            char esc = text[pos++];
+            switch (esc) {
+            case '\\': out.push_back('\\'); break;
+            case '"':  out.push_back('"'); break;
+            case 'r':  out.push_back('\r'); break;
+            case 'n':  out.push_back('\n'); break;
+            case 't':  out.push_back('\t'); break;
+            default:   out.push_back(esc); break;
+            }
+        }
+        else {
+            out.push_back(ch);
+        }
+    }
+
+    return false;
+}
+
+static bool LoadCombinePendingJobFile(const std::wstring& jobPath, PendingCombineJobFile& outJob) {
+    FILE* f = _wfopen(jobPath.c_str(), L"rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        fclose(f);
+        return false;
+    }
+
+    std::string text((size_t)sz, '\0');
+    if (sz > 0) fread(&text[0], 1, (size_t)sz, f);
+    fclose(f);
+
+    size_t pos = 0;
+    if (!ParseJsonExpected(text, pos, '{')) return false;
+
+    outJob = PendingCombineJobFile();
+
+    while (true) {
+        SkipJsonWs(text, pos);
+        if (pos >= text.size()) return false;
+        if (text[pos] == '}') {
+            ++pos;
+            break;
+        }
+
+        std::string key;
+        if (!ParseJsonStringToken(text, pos, key)) return false;
+        if (!ParseJsonExpected(text, pos, ':')) return false;
+
+        if (key == "title") {
+            std::string v;
+            if (!ParseJsonStringToken(text, pos, v)) return false;
+            outJob.title = Utf8ToWide(v);
+        }
+        else if (key == "working_dir") {
+            std::string v;
+            if (!ParseJsonStringToken(text, pos, v)) return false;
+            outJob.workingDir = Utf8ToWide(v);
+        }
+        else if (key == "combined_full") {
+            std::string v;
+            if (!ParseJsonStringToken(text, pos, v)) return false;
+            outJob.combinedFull = Utf8ToWide(v);
+        }
+        else if (key == "commands") {
+            if (!ParseJsonExpected(text, pos, '[')) return false;
+            outJob.commands.clear();
+            while (true) {
+                SkipJsonWs(text, pos);
+                if (pos >= text.size()) return false;
+                if (text[pos] == ']') {
+                    ++pos;
+                    break;
+                }
+                std::string v;
+                if (!ParseJsonStringToken(text, pos, v)) return false;
+                outJob.commands.push_back(Utf8ToWide(v));
+                SkipJsonWs(text, pos);
+                if (pos < text.size() && text[pos] == ',') {
+                    ++pos;
+                    continue;
+                }
+                SkipJsonWs(text, pos);
+                if (pos < text.size() && text[pos] == ']') {
+                    ++pos;
+                    break;
+                }
+            }
+        }
+        else {
+            return false;
+        }
+
+        SkipJsonWs(text, pos);
+        if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+    }
+
+    return !outJob.workingDir.empty() && !outJob.combinedFull.empty();
+}
+
+static bool SaveCombinePendingJobFile(const std::wstring& jobPath, const PendingCombineJobFile& job) {
+    std::wstring pendingDir = FolderOfFileWithSlash(jobPath);
+    if (!EnsureDirectoryExistsDeep(pendingDir)) return false;
+
+    std::ostringstream oss;
+    oss << "{\n"
+        << "  \"title\": \"" << JsonEscapeUtf8(ToUtf8(job.title)) << "\",\n"
+        << "  \"working_dir\": \"" << JsonEscapeUtf8(ToUtf8(job.workingDir)) << "\",\n"
+        << "  \"combined_full\": \"" << JsonEscapeUtf8(ToUtf8(job.combinedFull)) << "\",\n"
+        << "  \"commands\": [\n";
+
+    for (size_t i = 0; i < job.commands.size(); ++i) {
+        oss << "    \"" << JsonEscapeUtf8(ToUtf8(job.commands[i])) << "\"";
+        if (i + 1 < job.commands.size()) oss << ",";
+        oss << "\n";
+    }
+
+    oss << "  ]\n"
+        << "}\n";
+
+    std::string utf8 = oss.str();
+    std::wstring tempPath = jobPath + L"._tmp";
+
+    HANDLE h = CreateFileW(tempPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    DWORD wrote = 0;
+    BOOL wok = WriteFile(h, utf8.data(), (DWORD)utf8.size(), &wrote, NULL);
+    CloseHandle(h);
+    if (!wok || wrote != (DWORD)utf8.size()) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    if (!MoveFileExW(tempPath.c_str(), jobPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static bool HasReservedPath(const std::vector<std::wstring>& reserved, const std::wstring& candidate) {
+    for (const auto& it : reserved) {
+        if (_wcsicmp(it.c_str(), candidate.c_str()) == 0) return true;
+    }
+    return false;
+}
+
+static std::wstring UniqueNamePlanned(const std::wstring& folder,
+    const std::wstring& base,
+    const std::wstring& ext,
+    std::vector<std::wstring>& reserved)
+{
+    std::wstring target = folder + base + ext;
+    if (!PathFileExistsW(target.c_str()) && !HasReservedPath(reserved, target)) {
+        reserved.push_back(target);
+        return target;
+    }
+
+    for (int i = 1; i < 10000; ++i) {
+        wchar_t buf[32]; swprintf_s(buf, L" (%d)", i);
+        std::wstring t = folder + base + buf + ext;
+        if (!PathFileExistsW(t.c_str()) && !HasReservedPath(reserved, t)) {
+            reserved.push_back(t);
+            return t;
+        }
+    }
+
+    reserved.push_back(target);
+    return target;
+}
+
+static std::wstring FfmpegConcatListPath(std::wstring path) {
+    std::wstring out;
+    out.reserve(path.size() + 8);
+    for (wchar_t ch : path) {
+        if (ch == L'\\') out += L'/';
+        else if (ch == L'\'') out += L"\\'";
+        else out += ch;
+    }
+    return out;
+}
+
+static bool WriteFfmpegConcatListFile(const std::wstring& listPath,
+    const std::vector<std::wstring>& files)
+{
+    if (listPath.empty() || files.empty()) return false;
+
+    std::wstring text = L"ffconcat version 1.0\r\n";
+    for (const auto& f : files) {
+        if (f.empty()) return false;
+        text += L"file '";
+        text += FfmpegConcatListPath(f);
+        text += L"'\r\n";
+    }
+
+    return WriteUtf8TextFile(listPath, text);
+}
+
+static std::wstring BuildFfmpegConcatCommand(const std::wstring& listFile,
+    const std::wstring& outputPath)
+{
+    std::wstring ffmpegExe = QuoteArg(g_ffmpegExeW);
+    std::wstring quotedList = QuoteArg(listFile);
+    std::wstring quotedOut = QuoteArg(outputPath);
+
+    std::wstring copyCmd =
+        ffmpegExe +
+        L" -y -hide_banner -f concat -safe 0 -i " + quotedList +
+        L" -map 0 -c copy " + quotedOut;
+
+    std::wstring fallbackCmd =
+        ffmpegExe +
+        L" -y -hide_banner -f concat -safe 0 -i " + quotedList +
+        L" -map 0:v:0 -map 0:a? -sn -dn"
+        L" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p"
+        L" -c:a aac -b:a 192k " + quotedOut;
+
+    return L"(" + copyCmd + L") || (if exist " + quotedOut +
+        L" del /F /Q " + quotedOut + L" & " + fallbackCmd + L")";
+}
+
+static std::wstring BuildFfprobeVerifyCommand(const std::wstring& mediaPath) {
+    return QuoteArg(g_ffprobeExeW) +
+        L" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 " +
+        QuoteArg(mediaPath) + L" >nul";
+}
+
+static bool AppendConcatCombineCommandsForFiles(const std::vector<std::wstring>& files,
+    const std::wstring& workingDir,
+    const std::wstring& actualCombinedFull,
+    std::vector<std::wstring>& commands)
+{
+    if (files.size() < 2 || workingDir.empty() || actualCombinedFull.empty()) return false;
+
+    std::wstring workingDirWithSlash = EnsureSlash(workingDir);
+    if (!EnsureDirectoryExistsDeep(workingDirWithSlash)) return false;
+
+    std::wstring listFile = workingDirWithSlash + L"concat_list.ffconcat";
+    if (!WriteFfmpegConcatListFile(listFile, files)) return false;
+
+    AppendDeleteIfExistsCommand(commands, actualCombinedFull, true);
+    commands.push_back(BuildFfmpegConcatCommand(listFile, actualCombinedFull));
+    commands.push_back(BuildFfprobeVerifyCommand(actualCombinedFull));
+    return true;
+}
+
+static bool BuildCombinePendingCommands(const std::vector<std::wstring>& srcFiles,
+    const std::wstring& workingDir,
+    const std::wstring& requestedCombinedFull,
+    std::wstring& outActualCombinedFull,
+    std::vector<std::wstring>& outCommands)
+{
+    outCommands.clear();
+    outActualCombinedFull.clear();
+    if (srcFiles.empty() || workingDir.empty() || requestedCombinedFull.empty()) return false;
+
+    std::wstring workingDirWithSlash = EnsureSlash(workingDir);
+    std::wstring workingDirCmd = TrimTrailingSlashForCmd(workingDirWithSlash);
+
+    wchar_t reqDrive[_MAX_DRIVE] = {}, reqDir[_MAX_DIR] = {}, reqName[_MAX_FNAME] = {}, reqExt[_MAX_EXT] = {};
+    _wsplitpath_s(requestedCombinedFull.c_str(), reqDrive, _MAX_DRIVE, reqDir, _MAX_DIR, reqName, _MAX_FNAME, reqExt, _MAX_EXT);
+    std::wstring reqExtW = (*reqExt ? reqExt : L".mp4");
+    outActualCombinedFull = std::wstring(reqDrive) + reqDir + reqName + L"_combined" + reqExtW;
+
+    outCommands.push_back(L"if not exist " + QuoteArg(workingDirCmd) + L" mkdir " + QuoteArg(workingDirCmd));
+
+    if (!AppendConcatCombineCommandsForFiles(srcFiles, workingDirWithSlash, outActualCombinedFull, outCommands)) {
+        outCommands.clear();
+        outActualCombinedFull.clear();
+        return false;
+    }
+
+    return !outCommands.empty();
+}
+
+static DWORD RunHiddenCommandW(const std::wstring& cmdW) {
+    if (cmdW.empty()) return (DWORD)-1;
+
+    std::vector<wchar_t> cmdBuf(cmdW.begin(), cmdW.end());
+    cmdBuf.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    BOOL ok = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (!ok) return (DWORD)-1;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exitCode;
+}
+
+static std::wstring MakeTempCommandScriptPath() {
+    wchar_t tempDir[MAX_PATH] = {};
+    DWORD n = GetTempPathW(MAX_PATH, tempDir);
+    if (!n || n >= MAX_PATH) return L"";
+
+    GUID guid{};
+    if (FAILED(CoCreateGuid(&guid))) return L"";
+
+    wchar_t guidBuf[64] = {};
+    if (StringFromGUID2(guid, guidBuf, _countof(guidBuf)) <= 0) return L"";
+
+    std::wstring stem = SanitizeFileNameComponent(guidBuf);
+    return EnsureSlash(std::wstring(tempDir)) + L"mediaexplorer_cmd_" + stem + L".cmd";
+}
+
+static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    std::string utf8 = ToUtf8(text);
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(h, utf8.data(), (DWORD)utf8.size(), &wrote, NULL);
+    CloseHandle(h);
+    if (!ok || wrote != (DWORD)utf8.size()) {
+        DeleteFileW(path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static DWORD RunHiddenCommandWViaCmd(const std::wstring& innerCmdW) {
+    if (innerCmdW.empty()) return 1;
+
+    std::wstring scriptPath = MakeTempCommandScriptPath();
+    if (scriptPath.empty()) return 1;
+
+    std::wstring scriptText = L"@echo off\r\nver >nul\r\n";
+    scriptText += innerCmdW;
+    scriptText += L"\r\nexit /b\r\n";
+
+    if (!WriteUtf8TextFile(scriptPath, scriptText)) return 1;
+
+    wchar_t comSpecBuf[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"ComSpec", comSpecBuf, _countof(comSpecBuf));
+    std::wstring cmdExe = (n > 0 && n < _countof(comSpecBuf)) ? std::wstring(comSpecBuf) : L"cmd.exe";
+
+    DWORD exitCode = RunHiddenCommandW(QuoteArg(cmdExe) + L" /D /S /C " + QuoteArg(scriptPath));
+    DeleteFileW(scriptPath.c_str());
+    return exitCode;
+}
+
+static bool ExtractLegacyMpgInputPath(const std::wstring& cmd, std::wstring& outPath) {
+    outPath.clear();
+
+    size_t qscale = cmd.find(L" -qscale:v 1 ");
+    if (qscale == std::wstring::npos) return false;
+
+    size_t inputMarker = cmd.find(L" -i ");
+    if (inputMarker == std::wstring::npos || inputMarker >= qscale) return false;
+
+    size_t start = inputMarker + 4;
+    while (start < qscale && iswspace(cmd[start])) ++start;
+    if (start >= qscale) return false;
+
+    if (cmd[start] == L'"') {
+        size_t end = cmd.find(L'"', start + 1);
+        if (end == std::wstring::npos || end > qscale) return false;
+        outPath = cmd.substr(start + 1, end - start - 1);
+    }
+    else {
+        outPath = Trim(cmd.substr(start, qscale - start));
+    }
+
+    return !outPath.empty();
+}
+
+static bool MigrateLegacyMpgCombineJob(PendingCombineJobFile& job) {
+    if (job.commands.empty() || job.workingDir.empty() || job.combinedFull.empty()) return false;
+
+    std::vector<std::wstring> copiedFiles;
+    for (const auto& cmd : job.commands) {
+        std::wstring copied;
+        if (!ExtractLegacyMpgInputPath(cmd, copied)) continue;
+        if (!HasReservedPath(copiedFiles, copied)) copiedFiles.push_back(copied);
+    }
+
+    if (copiedFiles.size() < 2) return false;
+
+    for (const auto& copied : copiedFiles) {
+        DWORD attrs = GetFileAttributesW(copied.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            return false;
+        }
+    }
+
+    std::vector<std::wstring> migrated;
+    if (!AppendConcatCombineCommandsForFiles(copiedFiles, job.workingDir, job.combinedFull, migrated)) {
+        return false;
+    }
+
+    job.commands.swap(migrated);
+    return true;
+}
+
+static bool StartCombineTaskFromPendingJob(const PendingCombineJobFile& job,
+    const std::wstring& pendingJsonPath,
+    const std::wstring& initialLogLine,
+    bool deletePendingOnStartFailure)
+{
+    CombineTask* task = new CombineTask();
+    task->workingDir = job.workingDir;
+    task->combinedFull = job.combinedFull;
+    task->title = job.title.empty() ? BaseNameOnly(job.combinedFull) : job.title;
+    task->pendingJsonPath = pendingJsonPath;
+    task->pendingCommands = job.commands;
+    task->running = true;
+
+    EnsureCombineLogClass();
+    HWND logWnd = CreateCombineLogWindow(task);
+    if (!logWnd) {
+        if (deletePendingOnStartFailure && !pendingJsonPath.empty()) DeleteFileW(pendingJsonPath.c_str());
+        delete task;
+        return false;
+    }
+    task->hwnd = logWnd;
+
+    EnterCriticalSection(&g_combineLock);
+    g_combineTasks.push_back(task);
+    LeaveCriticalSection(&g_combineLock);
+
+    HANDLE hThread = CreateThread(NULL, 0, CombineThreadProc, task, 0, NULL);
+    if (!hThread) {
+        EnterCriticalSection(&g_combineLock);
+        auto it = std::find(g_combineTasks.begin(), g_combineTasks.end(), task);
+        if (it != g_combineTasks.end()) g_combineTasks.erase(it);
+        LeaveCriticalSection(&g_combineLock);
+
+        if (task->hwnd && IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
+        if (deletePendingOnStartFailure && !pendingJsonPath.empty()) DeleteFileW(pendingJsonPath.c_str());
+        delete task;
+        return false;
+    }
+
+    task->hThread = hThread;
+    if (!initialLogLine.empty()) PostCombineOutput(task, initialLogLine);
+    return true;
+}
+
+static void ResumePendingCombineJobs() {
+    std::wstring pendingDir = GetCombinePendingDir();
+    if (!DirExistsW(pendingDir)) return;
+
+    std::wstring pattern = pendingDir + L"*.json";
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+        std::wstring jobPath = pendingDir + fd.cFileName;
+        PendingCombineJobFile job{};
+        if (!LoadCombinePendingJobFile(jobPath, job)) {
+            LogLine(L"Failed to load pending combine job \"%s\"", jobPath.c_str());
+            continue;
+        }
+
+        bool migratedLegacyJob = false;
+        if (MigrateLegacyMpgCombineJob(job)) {
+            migratedLegacyJob = true;
+            if (!SaveCombinePendingJobFile(jobPath, job)) {
+                LogLine(L"Failed to save migrated pending combine job \"%s\"", jobPath.c_str());
+                continue;
+            }
+            LogLine(L"Migrated legacy MPG combine job \"%s\" to concat pipeline", jobPath.c_str());
+        }
+
+        if (job.commands.empty()) {
+            DeleteFileW(jobPath.c_str());
+            continue;
+        }
+
+        wchar_t countBuf[32];
+        swprintf_s(countBuf, L"%zu", job.commands.size());
+        std::wstring msg = L"Resuming pending combine job:\r\n";
+        msg += jobPath;
+        msg += L"\r\nRemaining commands: ";
+        msg += countBuf;
+        if (migratedLegacyJob) {
+            msg += L"\r\nMigrated legacy MPG combine job to concat pipeline.";
+        }
+        msg += L"\r\n";
+
+        if (!StartCombineTaskFromPendingJob(job, jobPath, msg, false)) {
+            LogLine(L"Failed to restart pending combine job \"%s\"", jobPath.c_str());
+        }
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+}
+
 // Combine selected files using external video_combine.exe in background thread.
 // Combine selected files using external video_combine.exe in background thread.
 // Now supports Folder view AND Search view.
@@ -3264,6 +3953,12 @@ static void Browser_CombineSelected() {
     std::vector<std::wstring> srcFiles;
     srcFiles.reserve(selIdx.size());
     for (int i : selIdx) srcFiles.push_back(g_rows[i].full);
+
+    std::wstring validationError;
+    if (!ValidateCombineSourceDimensions(srcFiles, validationError)) {
+        MessageBoxW(g_hwndMain, validationError.c_str(), L"Combine videos", MB_OK | MB_ICONERROR);
+        return;
+    }
 
     // Pick a "base output folder":
     // - Folder view: current folder
@@ -3314,51 +4009,36 @@ static void Browser_CombineSelected() {
 
     std::wstring copyDir = folderWithSlash + outStem + L"\\";
 
-    CombineTask* task = new CombineTask();
-    task->workingDir = copyDir;
-    task->srcFiles = srcFiles;
-    task->combinedFull = combinedFull;
-    task->title = baseOutName;
-    task->running = true;
-
-    EnsureCombineLogClass();
-    HWND logWnd = CreateCombineLogWindow(task);
-    if (!logWnd) {
-        delete task;
-        MessageBoxW(g_hwndMain, L"Failed to create log window for video combine.", L"Combine videos",
-            MB_OK);
-        return;
-    }
-    task->hwnd = logWnd;
-
-    EnterCriticalSection(&g_combineLock);
-    g_combineTasks.push_back(task);
-    LeaveCriticalSection(&g_combineLock);
-
-    HANDLE hThread = CreateThread(NULL, 0, CombineThreadProc, task, 0, NULL);
-    if (!hThread) {
-        EnterCriticalSection(&g_combineLock);
-        auto it = std::find(g_combineTasks.begin(), g_combineTasks.end(), task);
-        if (it != g_combineTasks.end()) g_combineTasks.erase(it);
-        LeaveCriticalSection(&g_combineLock);
-
-        if (IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
-        delete task;
-
-        MessageBoxW(g_hwndMain, L"Failed to start background thread for video combine.",
+    PendingCombineJobFile job{};
+    job.title = baseOutName;
+    job.workingDir = copyDir;
+    if (!BuildCombinePendingCommands(srcFiles, copyDir, combinedFull, job.combinedFull, job.commands)) {
+        MessageBoxW(g_hwndMain, L"Failed to build pending commands for video combine.",
             L"Combine videos", MB_OK);
         return;
     }
 
-    task->hThread = hThread;
+    std::wstring pendingJsonPath = MakePendingCombineJobPath(outStem.empty() ? baseOutName : outStem);
+    if (pendingJsonPath.empty() || !SaveCombinePendingJobFile(pendingJsonPath, job)) {
+        MessageBoxW(g_hwndMain, L"Failed to create pending job file for video combine.",
+            L"Combine videos", MB_OK);
+        return;
+    }
 
     std::wstring startMsg = L"Starting combine for ";
-    wchar_t buf2[64]; swprintf_s(buf2, L"%zu", task->srcFiles.size());
+    wchar_t buf2[64]; swprintf_s(buf2, L"%zu", srcFiles.size());
     startMsg += buf2;
     startMsg += L" file(s)...\r\nWorking directory: ";
-    startMsg += task->workingDir;
+    startMsg += job.workingDir;
+    startMsg += L"\r\nPending job: ";
+    startMsg += pendingJsonPath;
     startMsg += L"\r\n";
-    PostCombineOutput(task, startMsg);
+
+    if (!StartCombineTaskFromPendingJob(job, pendingJsonPath, startMsg, true)) {
+        MessageBoxW(g_hwndMain, L"Failed to start background thread for video combine.",
+            L"Combine videos", MB_OK);
+        return;
+    }
 }
 
 // ----------------------------- Dialog helpers (playback)
@@ -3703,7 +4383,7 @@ static void ApplyPostActionsAndRefresh(bool /*hadFfmpegTasks*/) {
             std::wstring title = L"Delete: ";
             title += base;
 
-            // still do the actual delete async, but don’t trigger a reload
+            // still do the actual delete async, but don't trigger a reload
             ScheduleDeleteFilesAsync(one, title, true);
             break;
         }
@@ -3727,7 +4407,7 @@ static void ApplyPostActionsAndRefresh(bool /*hadFfmpegTasks*/) {
             std::wstring title = L"Copy: ";
             title += base;
 
-            // async copy; we don’t add it to the list unless it lands in this folder (optional later)
+            // async copy; we don't add it to the list unless it lands in this folder (optional later)
             ScheduleCopyToPathAsync(a.src, a.param, title, true);
             break;
         }
@@ -4572,6 +5252,77 @@ static void FileOpEmit(FileOpTask* task, const std::wstring& text)
     }
 }
 
+static bool DeletePathRecursive(FileOpTask* task, const std::wstring& path, DWORD& outErr)
+{
+    outErr = 0;
+    std::wstring target = TrimTrailingSlashForCmd(path);
+    if (target.empty()) {
+        outErr = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+
+    DWORD attrs = GetFileAttributesW(target.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return true;
+        outErr = err;
+        return false;
+    }
+
+    if (attrs & FILE_ATTRIBUTE_READONLY) {
+        SetFileAttributesW(target.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+        attrs = GetFileAttributesW(target.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) attrs = 0;
+    }
+
+    const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    const bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+    if (!isDir) {
+        if (DeleteFileW(target.c_str())) return true;
+        outErr = GetLastError();
+        return false;
+    }
+
+    if (!isReparse) {
+        std::wstring pattern = EnsureSlash(target) + L"*";
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+                    continue;
+
+                if (task && task->cancel.load(std::memory_order_relaxed)) {
+                    FindClose(hFind);
+                    outErr = ERROR_CANCELLED;
+                    return false;
+                }
+
+                std::wstring child = EnsureSlash(target) + fd.cFileName;
+                DWORD childErr = 0;
+                if (!DeletePathRecursive(task, child, childErr)) {
+                    FindClose(hFind);
+                    outErr = childErr ? childErr : 1;
+                    return false;
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+        else {
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                outErr = err;
+                return false;
+            }
+        }
+    }
+
+    if (RemoveDirectoryW(target.c_str())) return true;
+    outErr = GetLastError();
+    return false;
+}
+
 static void OnFileOpDone(FileOpTask* task, DWORD rc)
 {
     if (!task) return;
@@ -4748,12 +5499,23 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
             FileOpEmit(task, hdr);
             FileOpEmit(task, L"  " + p + L"\r\n");
 
-            if (!DeleteFileW(p.c_str())) {
-                DWORD err = GetLastError();
-                MoveFileExW(p.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+            DWORD err = 0;
+            if (!DeletePathRecursive(task, p, err)) {
+                if (err == ERROR_CANCELLED) {
+                    rc = ERROR_CANCELLED;
+                    break;
+                }
+
+                DWORD attrs = GetFileAttributesW(p.c_str());
+                bool queuedOnReboot = false;
+                if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    queuedOnReboot = MoveFileExW(p.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT) != FALSE;
+                }
 
                 wchar_t buf[256];
-                swprintf_s(buf, L"  FAILED (err=%lu) -> queued delete on reboot\r\n\r\n", err);
+                swprintf_s(buf, queuedOnReboot
+                    ? L"  FAILED (err=%lu) -> queued delete on reboot\r\n\r\n"
+                    : L"  FAILED (err=%lu)\r\n\r\n", err);
                 FileOpEmit(task, buf);
 
                 if (rc == 0) rc = err ? err : 1;
@@ -5455,6 +6217,22 @@ static bool RunEmbeddedVideoCombine(CombineTask* task,
     return ok;
 }
 
+static void DeleteCombineFileIfExists(CombineTask* task, const std::wstring& path) {
+    if (!task || path.empty()) return;
+    if (!PathFileExistsW(path.c_str())) return;
+
+    if (!DeleteFileW(path.c_str())) {
+        DWORD err = GetLastError();
+        wchar_t buf[512];
+        swprintf_s(buf,
+            L"Warning: failed to remove combine file \"%s\" (err=%lu)\r\n",
+            path.c_str(), err);
+        PostCombineOutput(task, buf);
+        LogLine(L"Failed to remove combine file \"%s\" err=%lu",
+            path.c_str(), err);
+    }
+}
+
 // Delete the combine working directory and its files (shallow) on success.
 static void DeleteCombineWorkingDirIfExists(CombineTask* task) {
     if (!task) return;
@@ -5501,76 +6279,81 @@ static DWORD WINAPI CombineThreadProc(LPVOID param) {
     CombineTask* task = (CombineTask*)param;
     if (!task) return 0;
 
-    // Create working directory
-    if (!CreateDirectoryW(task->workingDir.c_str(), NULL)) {
-        DWORD e = GetLastError();
-        if (e != ERROR_ALREADY_EXISTS) {
-            std::wstring msg = L"ERROR: Failed to create working directory:\r\n";
-            msg += task->workingDir;
-            msg += L"\r\n";
-            PostCombineOutput(task, msg);
+    if (task->pendingCommands.empty()) {
+        if (!task->pendingJsonPath.empty()) DeleteFileW(task->pendingJsonPath.c_str());
+        VC_UpdateCombineWindowTitle(task, L"(done)");
+        PostCombineOutput(task, L"\r\n[pending combine queue already complete]\r\n");
+        PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)0);
+        return 0;
+    }
+
+    while (!task->pendingCommands.empty()) {
+        const std::wstring cmd = task->pendingCommands.front();
+        const bool isFfmpeg = (cmd.find(g_ffmpegExeW) != std::wstring::npos) ||
+            (cmd.find(L"ffmpeg") != std::wstring::npos);
+
+        if (isFfmpeg) {
+            VC_UpdateCombineWindowTitle(task, L"(ffmpeg in progress...)");
+        }
+        else {
+            VC_UpdateCombineWindowTitle(task, L"(running...)");
+        }
+
+        PostCombineOutput(task, L"> " + cmd + L"\r\n");
+
+        DWORD exitCode = RunHiddenCommandWViaCmd(cmd);
+        if (exitCode != 0) {
+            wchar_t failBuf[256];
+            swprintf_s(failBuf, L"ERROR: command failed with code %lu\r\n", exitCode);
+            PostCombineOutput(task, failBuf);
+            VC_UpdateCombineWindowTitle(task, L"(failed)");
+            PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)(exitCode ? exitCode : 1));
+            return 0;
+        }
+
+        task->pendingCommands.erase(task->pendingCommands.begin());
+
+        PendingCombineJobFile job{};
+        job.title = task->title;
+        job.workingDir = task->workingDir;
+        job.combinedFull = task->combinedFull;
+        job.commands = task->pendingCommands;
+
+        if (!task->pendingJsonPath.empty() && !SaveCombinePendingJobFile(task->pendingJsonPath, job)) {
+            PostCombineOutput(task, L"ERROR: failed to update pending job file after completing a command.\r\n");
+            VC_UpdateCombineWindowTitle(task, L"(failed)");
             PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)1);
             return 0;
         }
     }
 
-    // Copy files into working directory (same as before)
-    {
-        wchar_t buf[256];
-        swprintf_s(buf, L"Copying %zu file(s)...\r\n", task->srcFiles.size());
-        PostCombineOutput(task, buf);
+    PostCombineOutput(task, L"> verifying output with ffprobe\r\n");
+    if (!PathFileExistsW(task->combinedFull.c_str()) ||
+        RunHiddenCommandWViaCmd(BuildFfprobeVerifyCommand(task->combinedFull)) != 0) {
+        PostCombineOutput(task, L"ERROR: combined output failed ffprobe validation.\r\n");
+        VC_UpdateCombineWindowTitle(task, L"(failed)");
+        PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)1);
+        return 0;
     }
 
-    std::vector<std::wstring> copiedFiles;
-    copiedFiles.reserve(task->srcFiles.size());
+    wchar_t drive[_MAX_DRIVE] = {}, dir[_MAX_DIR] = {}, name[_MAX_FNAME] = {};
+    _wsplitpath_s(task->combinedFull.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, name, _MAX_FNAME, NULL, 0);
+    std::wstring combineFile = std::wstring(drive) + dir + name + L".mpg";
+    DeleteCombineFileIfExists(task, combineFile);
+    DeleteCombineWorkingDirIfExists(task);
 
-    for (size_t i = 0; i < task->srcFiles.size(); ++i) {
-        const std::wstring& src = task->srcFiles[i];
-        const wchar_t* base = wcsrchr(src.c_str(), L'\\');
-        base = base ? base + 1 : src.c_str();
-
-        // Make destination unique inside the working directory (important for Search view)
-        wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
-        _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
-
-        std::wstring dstFolder = EnsureSlash(task->workingDir);
-        std::wstring dst = UniqueName(dstFolder, fname, ext);
-
-        std::wstring line = L"  -> ";
-        line += dst;
-        line += L"\r\n";
-        PostCombineOutput(task, line);
-
-        if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
-            std::wstring err = L"ERROR: Failed to copy file:\r\n";
-            err += src;
-            err += L"\r\n";
-            PostCombineOutput(task, err);
-            PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)2);
-            return 0;
+    if (!task->pendingJsonPath.empty() && !DeleteFileW(task->pendingJsonPath.c_str())) {
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND) {
+            wchar_t warnBuf[256];
+            swprintf_s(warnBuf, L"Warning: failed to delete pending job file (err=%lu)\r\n", err);
+            PostCombineOutput(task, warnBuf);
         }
-        copiedFiles.push_back(dst);
     }
 
-    PostCombineOutput(task, L"All files copied. Combining via internal ffmpeg pipeline...\r\n");
-
-    // --- NEW: run embedded video_combine algorithm instead of video_combine.exe ---
-    bool ok = RunEmbeddedVideoCombine(task, copiedFiles, task->combinedFull);
-
-    DWORD exitCode = ok ? 0 : 1;
-
-    // On success, remove the working directory that held the copied parts
-    if (ok) {
-        DeleteCombineWorkingDirIfExists(task);
-    }
-
-    wchar_t doneMsg[256];
-    swprintf_s(doneMsg, L"\r\n[internal video combine %s with code %lu]\r\n",
-        ok ? L"succeeded" : L"failed", exitCode);
-    PostCombineOutput(task, doneMsg);
-
-    // Notify main window that the combine task is done (same message ID as before)
-    PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)exitCode);
+    VC_UpdateCombineWindowTitle(task, L"(done)");
+    PostCombineOutput(task, L"\r\n[pending combine queue succeeded with code 0]\r\n");
+    PostMessageW(g_hwndMain, WM_APP_COMBINE_DONE, (WPARAM)task, (LPARAM)0);
     return 0;
 }
 
@@ -5967,6 +6750,107 @@ static void HandleTopazSubmitFromListSelection()
     t->running = true;
 
     StartFileOpTask(t);
+}
+
+static std::wstring UniqueFolderPath(const std::wstring& folder, const std::wstring& baseName) {
+    std::wstring target = EnsureSlash(folder) + baseName;
+    if (!PathFileExistsW(target.c_str())) return target;
+
+    for (int i = 1; i < 10000; ++i) {
+        wchar_t suffix[32];
+        swprintf_s(suffix, L" (%d)", i);
+        std::wstring candidate = EnsureSlash(folder) + baseName + suffix;
+        if (!PathFileExistsW(candidate.c_str())) return candidate;
+    }
+
+    return target;
+}
+
+static void SelectPathInCurrentList(const std::wstring& fullPath) {
+    std::wstring targetDir = EnsureSlash(fullPath);
+    for (int i = 0; i < (int)g_rows.size(); ++i) {
+        std::wstring rowPath = g_rows[i].isDir ? EnsureSlash(g_rows[i].full) : g_rows[i].full;
+        if (_wcsicmp(rowPath.c_str(), targetDir.c_str()) == 0 ||
+            _wcsicmp(g_rows[i].full.c_str(), fullPath.c_str()) == 0) {
+            ListView_SetItemState(g_hwndList, i,
+                LVIS_SELECTED | LVIS_FOCUSED,
+                LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(g_hwndList, i, FALSE);
+            return;
+        }
+    }
+}
+
+static void Browser_CreateNewFolder() {
+    if (g_view != ViewKind::Folder || g_folder.empty()) return;
+
+    std::wstring target = UniqueFolderPath(g_folder, L"New Folder");
+    int rc = SHCreateDirectoryExW(g_hwndMain, target.c_str(), NULL);
+    if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && !DirExistsW(target)) {
+        wchar_t buf[512];
+        swprintf_s(buf, L"Failed to create folder:\n%s\n\nError: %d", target.c_str(), rc);
+        MessageBoxW(g_hwndMain, buf, L"New Folder", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    ShowFolder(g_folder);
+    SelectPathInCurrentList(target);
+    StatusBarSetText(L"Created folder: " + BaseNameOnly(target));
+}
+
+static POINT ListContextMenuPoint(LPARAM lParam) {
+    POINT pt{};
+    if (lParam == (LPARAM)-1) {
+        int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
+        if (sel >= 0) {
+            RECT rc{};
+            if (ListView_GetItemRect(g_hwndList, sel, &rc, LVIR_BOUNDS)) {
+                pt.x = rc.left + (rc.right - rc.left) / 2;
+                pt.y = rc.top + (rc.bottom - rc.top) / 2;
+                ClientToScreen(g_hwndList, &pt);
+                return pt;
+            }
+        }
+
+        RECT rcList{};
+        GetWindowRect(g_hwndList, &rcList);
+        pt.x = rcList.left + (rcList.right - rcList.left) / 2;
+        pt.y = rcList.top + (rcList.bottom - rcList.top) / 2;
+        return pt;
+    }
+
+    pt.x = (SHORT)LOWORD(lParam);
+    pt.y = (SHORT)HIWORD(lParam);
+    return pt;
+}
+
+static void ShowListContextMenu(LPARAM lParam) {
+    if (g_inPlayback) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    bool added = false;
+    if (g_view == ViewKind::Folder && !g_folder.empty()) {
+        AppendMenuW(menu, MF_STRING, IDM_LIST_NEW_FOLDER, L"New Folder");
+        added = true;
+    }
+
+    if (!added) {
+        DestroyMenu(menu);
+        return;
+    }
+
+    POINT pt = ListContextMenuPoint(lParam);
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        pt.x, pt.y, 0, g_hwndMain, NULL);
+    DestroyMenu(menu);
+
+    switch (cmd) {
+    case IDM_LIST_NEW_FOLDER:
+        Browser_CreateNewFolder();
+        break;
+    }
 }
 
 // ----------------------------- Subclasses
@@ -6541,6 +7425,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
         else SetFocus(g_hwndList);
         return 0;
 
+    case WM_CONTEXTMENU:
+        if ((HWND)w == g_hwndList || ((HWND)w && IsChild(g_hwndList, (HWND)w))) {
+            ShowListContextMenu(l);
+            return 0;
+        }
+        break;
+
     case WM_NOTIFY: {
         LPNMHDR nm = (LPNMHDR)l;
         if (nm->hwndFrom == g_hwndList) {
@@ -6962,6 +7853,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
 
     ShowWindow(g_hwndMain, nShow);
     UpdateWindow(g_hwndMain);
+    ResumePendingCombineJobs();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

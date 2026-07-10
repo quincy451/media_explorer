@@ -44,19 +44,22 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\test\media_explorer\vlclib\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vlclib\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\test\media_explorer\vlclib\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)vlclib\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>libvlc.lib;libvlccore.lib;User32.lib;Gdi32.lib;Comctl32.lib;Comdlg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Propsys.lib;Uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>
-xcopy /Y /D "C:\test\media_explorer\vlclib\bin\libvlc.dll" "$(OutDir)"
-xcopy /Y /D "C:\test\media_explorer\vlclib\bin\libvlccore.dll" "$(OutDir)"
-xcopy /E /I /Y /D "C:\test\media_explorer\vlclib\plugins" "$(OutDir)plugins\"
+if exist "$(ProjectDir)vlclib\bin\libvlc.dll" xcopy /Y /D "$(ProjectDir)vlclib\bin\libvlc.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlclib\bin\libvlccore.dll" xcopy /Y /D "$(ProjectDir)vlclib\bin\libvlccore.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlclib\plugins\" xcopy /E /I /Y /D "$(ProjectDir)vlclib\plugins" "$(OutDir)plugins\"
+if exist "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlc.dll" xcopy /Y /D "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlc.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlccore.dll" xcopy /Y /D "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlccore.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\plugins\" xcopy /E /I /Y /D "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\plugins" "$(OutDir)plugins\"
       </Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -69,20 +72,23 @@ xcopy /E /I /Y /D "C:\test\media_explorer\vlclib\plugins" "$(OutDir)plugins\"
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\test\media_explorer\vlclib\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vlclib\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalLibraryDirectories>C:\test\media_explorer\vlclib\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)vlclib\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>libvlc.lib;libvlccore.lib;User32.lib;Gdi32.lib;Comctl32.lib;Comdlg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Propsys.lib;Uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>
-xcopy /Y /D "C:\test\media_explorer\vlclib\bin\libvlc.dll" "$(OutDir)"
-xcopy /Y /D "C:\test\media_explorer\vlclib\bin\libvlccore.dll" "$(OutDir)"
-xcopy /E /I /Y /D "C:\test\media_explorer\vlclib\plugins" "$(OutDir)plugins\"
+if exist "$(ProjectDir)vlclib\bin\libvlc.dll" xcopy /Y /D "$(ProjectDir)vlclib\bin\libvlc.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlclib\bin\libvlccore.dll" xcopy /Y /D "$(ProjectDir)vlclib\bin\libvlccore.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlclib\plugins\" xcopy /E /I /Y /D "$(ProjectDir)vlclib\plugins" "$(OutDir)plugins\"
+if exist "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlc.dll" xcopy /Y /D "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlc.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlccore.dll" xcopy /Y /D "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\libvlccore.dll" "$(OutDir)"
+if exist "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\plugins\" xcopy /E /I /Y /D "$(ProjectDir)vlc-3.0.23\vlc-3.0.23\plugins" "$(OutDir)plugins\"
       </Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
