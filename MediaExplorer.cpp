@@ -87,6 +87,7 @@ using Microsoft::WRL::ComPtr;
 static void LogLine(const wchar_t* fmt, ...); // forward declaration
 // Forward-declare DPI scaler because some dialogs use it before the definition below.
 static int DpiScale(int px);
+static std::wstring Win32ErrorText(DWORD error);
 
 // ----------------------------- Globals
 HINSTANCE g_hInst = NULL;
@@ -100,6 +101,9 @@ HWND g_hwndSeek = NULL;
 enum class ViewKind { Drives, Folder, Search };
 ViewKind g_view = ViewKind::Drives;
 std::wstring g_folder; // valid in Folder view, ends with '\'
+std::wstring g_pendingNewFolderRenamePath; // just-created folder, without trailing '\'
+std::wstring g_newFolderReselectPath;      // successful rename awaiting list re-sort
+bool g_refreshAfterNewFolderRename = false;
 
 struct Row {
     std::wstring name;     // display (for Search, full path; for Folder, file name)
@@ -143,6 +147,7 @@ bool g_sortAsc = true;
 libvlc_instance_t* g_vlc = NULL;
 libvlc_media_player_t* g_mp = NULL;
 bool                      g_inPlayback = false;
+bool                      g_exitingPlayback = false;
 std::vector<std::wstring> g_playlist;
 size_t                    g_playlistIndex = 0;
 bool                      g_userDragging = false;
@@ -155,7 +160,7 @@ struct AppConfig {
     bool ffmpegAvailable = false;  // if true, ffmpeg-based tools are enabled & shown in help
     bool ffprobeAvailable = false;  // if true, ffprobe-based info is enabled & shown in help
     std::wstring topazUpscaleQueue; // e.g. w:\topaz_queue (AIDev NVMe). Job submit writes <video.ext> + <video.json> here.
-    std::wstring ffmpegPath;        // optional full path to ffmpeg.exe (your system ffmpeg 8.x). If empty, uses "ffmpeg" from PATH.
+    std::wstring ffmpegPath;        // optional full path to ffmpeg.exe. If empty, uses WinGet's command link or PATH.
     std::wstring ffprobePath;       // optional full path to ffprobe.exe. If empty, uses "ffprobe" from PATH.
 
     bool        loggingEnabled = false; // master on/off
@@ -284,6 +289,8 @@ constexpr UINT WM_APP_FILEOP_OUTPUT = WM_APP + 400;
 constexpr UINT WM_APP_FILEOP_DONE = WM_APP + 401;
 // NEW: background folder reload finished
 constexpr UINT WM_APP_FOLDER_RELOAD_DONE = WM_APP + 450;
+constexpr UINT WM_APP_BEGIN_NEW_FOLDER_RENAME = WM_APP + 451;
+constexpr UINT WM_APP_FINISH_NEW_FOLDER_RENAME = WM_APP + 452;
 static const UINT WMU_STATUS_OP = WM_APP + 250;
 
 enum class StatusOpAction : UINT_PTR { Begin = 1, Update = 2, End = 3 };
@@ -904,6 +911,35 @@ static bool HasRunningCombineTasks() {
 
 enum class FfmpegOpKind { TrimFront, TrimEnd, HFlip };
 
+static const wchar_t* FfmpegOpFileSuffix(FfmpegOpKind kind) {
+    switch (kind) {
+    case FfmpegOpKind::TrimFront: return L"_trimfront";
+    case FfmpegOpKind::TrimEnd:   return L"_trimend";
+    case FfmpegOpKind::HFlip:     return L"_hflip";
+    }
+    return L"_processed";
+}
+
+static std::wstring DefaultMediaToolPath(const wchar_t* executable) {
+    // WinGet's stable command-link directory survives package-version changes
+    // and is usable immediately even when an already-running desktop session
+    // has not yet picked up WinGet's PATH update.
+    wchar_t localAppData[32768] = {};
+    DWORD chars = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", localAppData, (DWORD)_countof(localAppData));
+    if (chars > 0 && chars < _countof(localAppData)) {
+        std::wstring candidate = localAppData;
+        candidate += L"\\Microsoft\\WinGet\\Links\\";
+        candidate += executable;
+        DWORD attributes = GetFileAttributesW(candidate.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            return candidate;
+        }
+    }
+    return executable;
+}
+
 struct FfmpegTask {
     HANDLE hThread = NULL;
     HANDLE hProcess = NULL;
@@ -913,18 +949,24 @@ struct FfmpegTask {
     std::wstring workingDir;   // ...video_process
     std::wstring inputCopy;    // workingDir + base.ext (copied original)
     std::wstring outputTemp;   // workingDir + base_<op>.ext  (ffmpeg output)
-    std::wstring finalWorking; // after rename, path of final processed file in workingDir
+    std::wstring finalWorking; // verified encoded output awaiting publication
+    std::wstring publishedFull;// final output beside the source after playback exits
     std::wstring title;        // short title, e.g. "Trim front: file.mp4"
     FfmpegOpKind kind;
     libvlc_time_t refMs = 0;   // time in ms when user invoked operation
-    bool running = false;
-    bool done = false;
+    libvlc_time_t expectedDurationMs = 0; // used to make live FFmpeg progress meaningful
+    std::atomic<bool> running{ false };
+    std::atomic<bool> done{ false };
     DWORD exitCode = 0;
     bool hiddenByPlayback = false;  // <--- NEW
+    bool workingDirCreated = false;
+    bool finalized = false;
+    bool publishSucceeded = false;
 };
 
 CRITICAL_SECTION g_ffLock;
 std::vector<FfmpegTask*> g_ffTasks;
+std::atomic<uint64_t> g_ffTaskSerial{ 0 };
 // Log/feedback windows that we temporarily hide while the user is
 // watching video fullscreen. We remember which ones we hid so we
 // can restore only those when leaving fullscreen.
@@ -1013,14 +1055,27 @@ static void RestoreLogWindowsAfterPlayback()
     LeaveCriticalSection(&g_combineLock);
 
     // FFmpeg logs
+    RECT ffWorkArea{};
+    GetWorkAreaForOwner(g_hwndMain, ffWorkArea);
+    int ffWindowIndex = 0;
     EnterCriticalSection(&g_ffLock);
     for (FfmpegTask* t : g_ffTasks)
     {
         if (t && t->hiddenByPlayback && t->hwnd && IsWindow(t->hwnd))
         {
+            RECT windowRect{};
+            GetWindowRect(t->hwnd, &windowRect);
+            const int width = windowRect.right - windowRect.left;
+            const int height = windowRect.bottom - windowRect.top;
+            const int offset = DpiScale(28) * ffWindowIndex++;
+            const int x = std::min(ffWorkArea.left + DpiScale(24) + offset,
+                std::max(ffWorkArea.left, ffWorkArea.right - width));
+            const int y = std::min(ffWorkArea.top + DpiScale(24) + offset,
+                std::max(ffWorkArea.top, ffWorkArea.bottom - height));
+
             ShowWindow(t->hwnd, SW_SHOWNOACTIVATE);
-            SetWindowPos(t->hwnd, HWND_TOP, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(t->hwnd, HWND_TOP, x, y, 0, 0,
+                SWP_NOSIZE | SWP_NOACTIVATE);
             t->hiddenByPlayback = false;
         }
     }
@@ -1110,6 +1165,7 @@ static LRESULT CALLBACK FfmpegLogProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
             4, 4, rc.right - 8, rc.bottom - 8, h, (HMENU)101, g_hInst, NULL);
         SendMessageW(hEdit, WM_SETFONT, (WPARAM)hf, TRUE);
+        SendMessageW(hEdit, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
 
         if (task) task->hEdit = hEdit;
         return 0;
@@ -1122,7 +1178,26 @@ static LRESULT CALLBACK FfmpegLogProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
-        ShowWindow(h, SW_HIDE); // hide, don't destroy; keep log available
+        if (task && task->finalized) {
+            task->hwnd = NULL;
+            task->hEdit = NULL;
+            DestroyWindow(h);
+
+            EnterCriticalSection(&g_ffLock);
+            auto it = std::find(g_ffTasks.begin(), g_ffTasks.end(), task);
+            if (it != g_ffTasks.end()) g_ffTasks.erase(it);
+            LeaveCriticalSection(&g_ffLock);
+
+            if (task->hProcess) CloseHandle(task->hProcess);
+            if (task->hThread) CloseHandle(task->hThread);
+            delete task;
+        }
+        else {
+            // Keep the running task alive, but remember that its feedback must
+            // be shown again once final success/failure details are appended.
+            task->hiddenByPlayback = true;
+            ShowWindow(h, SW_HIDE); // keep an active task's log available
+        }
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -1148,8 +1223,10 @@ static HWND CreateFfmpegLogWindow(FfmpegTask* task) {
     std::wstring title = L"FFmpeg task: ";
     title += task ? task->title : L"(unknown)";
 
+    DWORD style = WS_OVERLAPPEDWINDOW;
+    if (!g_inPlayback) style |= WS_VISIBLE;
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"FfmpegLogClass", title.c_str(),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        style,
         X, Y, W, H, g_hwndMain, NULL, g_hInst, task);
 
     if (hwnd && task)
@@ -1158,18 +1235,37 @@ static HWND CreateFfmpegLogWindow(FfmpegTask* task) {
 
         if (g_inPlayback)
         {
-            if (IsWindowVisible(hwnd))
-                ShowWindow(hwnd, SW_HIDE);
             task->hiddenByPlayback = true;
         }
     }
     return hwnd;
 }
 
+static void UpdateFfmpegWindowTitle(FfmpegTask* task, const wchar_t* statusSuffix) {
+    if (!task || !task->hwnd || !IsWindow(task->hwnd)) return;
+
+    std::wstring title = L"FFmpeg task: ";
+    title += task->title;
+    if (statusSuffix && *statusSuffix) {
+        title += L" ";
+        title += statusSuffix;
+    }
+    SetWindowTextW(task->hwnd, title.c_str());
+}
+
+static void AppendFfmpegOutputNow(FfmpegTask* task, const std::wstring& text) {
+    if (!task || !task->hEdit || !IsWindow(task->hEdit)) return;
+    SendMessageW(task->hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(task->hEdit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
+    SendMessageW(task->hEdit, EM_SCROLLCARET, 0, 0);
+}
+
 static void PostFfmpegOutput(FfmpegTask* task, const std::wstring& text) {
     if (!task) return;
     std::wstring* p = new std::wstring(text);
-    PostMessageW(g_hwndMain, WM_APP_FFMPEG_OUTPUT, (WPARAM)task, (LPARAM)p);
+    if (!PostMessageW(g_hwndMain, WM_APP_FFMPEG_OUTPUT, (WPARAM)task, (LPARAM)p)) {
+        delete p;
+    }
 }
 
 static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
@@ -1180,19 +1276,20 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
         task->sourceFull.c_str(), task->inputCopy.c_str(),
         task->outputTemp.c_str(), (int)task->kind, (long long)task->refMs);
 
-    // 1) Create working directory
-    if (!CreateDirectoryW(task->workingDir.c_str(), NULL)) {
-        DWORD e = GetLastError();
-        if (e != ERROR_ALREADY_EXISTS) {
+    // 1) Create the task-specific working directory (including its parent).
+    {
+        int rc = SHCreateDirectoryExW(NULL, task->workingDir.c_str(), NULL);
+        if (rc != ERROR_SUCCESS) {
             std::wstring msg = L"ERROR: Failed to create working directory:\r\n";
             msg += task->workingDir;
             msg += L"\r\n";
             PostFfmpegOutput(task, msg);
-            task->exitCode = 1;
+            task->exitCode = (DWORD)rc;
             task->running = false;
             PostMessageW(g_hwndMain, WM_APP_FFMPEG_DONE, (WPARAM)task, (LPARAM)task->exitCode);
             return 0;
         }
+        task->workingDirCreated = true;
     }
 
     // Paths should already be filled in, but ensure they're non-empty.
@@ -1277,11 +1374,66 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
     }
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags |= STARTF_USESTDHANDLES;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+    HANDLE hNullInput = CreateFileW(L"NUL", GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hNullInput == INVALID_HANDLE_VALUE) {
+        PostFfmpegOutput(task,
+            L"ERROR: Failed to prepare FFmpeg standard input.\r\n");
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        task->exitCode = 4;
+        task->running = false;
+        PostMessageW(g_hwndMain, WM_APP_FFMPEG_DONE,
+            (WPARAM)task, (LPARAM)task->exitCode);
+        return 0;
+    }
+    si.StartupInfo.hStdInput = hNullInput;
+    si.StartupInfo.hStdOutput = hWrite;
+    si.StartupInfo.hStdError = hWrite;
+
+    // Restrict inheritance to this task's pipe.  With unrestricted handle
+    // inheritance, two workers launched together can inherit each other's
+    // pipe writer and keep ReadFile from observing EOF until both exit.
+    SIZE_T attributeBytes = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attributeBytes);
+    std::vector<BYTE> attributeStorage(attributeBytes);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+        attributeStorage.data());
+    if (!attributeBytes ||
+        !InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0,
+            &attributeBytes)) {
+        PostFfmpegOutput(task,
+            L"ERROR: Failed to initialize FFmpeg process handle isolation.\r\n");
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        CloseHandle(hNullInput);
+        task->exitCode = 4;
+        task->running = false;
+        PostMessageW(g_hwndMain, WM_APP_FFMPEG_DONE,
+            (WPARAM)task, (LPARAM)task->exitCode);
+        return 0;
+    }
+
+    HANDLE inheritedHandles[] = { hWrite, hNullInput };
+    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        inheritedHandles, sizeof(inheritedHandles), NULL, NULL)) {
+        PostFfmpegOutput(task,
+            L"ERROR: Failed to isolate FFmpeg process handles.\r\n");
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        CloseHandle(hNullInput);
+        task->exitCode = 4;
+        task->running = false;
+        PostMessageW(g_hwndMain, WM_APP_FFMPEG_DONE,
+            (WPARAM)task, (LPARAM)task->exitCode);
+        return 0;
+    }
 
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmdBuf(cmd.size() + 1);
@@ -1289,10 +1441,12 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
 
     BOOL ok = CreateProcessW(NULL, cmdBuf.data(),
         NULL, NULL, TRUE,
-        CREATE_NO_WINDOW,
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
         NULL, NULL,
-        &si, &pi);
+        &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(si.lpAttributeList);
     CloseHandle(hWrite);
+    CloseHandle(hNullInput);
     hWrite = NULL;
 
     if (!ok) {
@@ -1307,30 +1461,82 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
     task->hProcess = pi.hProcess;
     CloseHandle(pi.hThread);
 
-    // 4) Read ffmpeg stdout/stderr
+    // 4) Read ffmpeg stdout/stderr.  FFmpeg's live statistics use bare '\r'
+    // records (not '\n'), so treating only newlines as records makes a long
+    // encode look frozen until the process exits.
     char buf[4096];
     DWORD bytes = 0;
     std::string accum;
+    ULONGLONG lastCarriageProgressTick = 0;
+
+    auto emitPipeRecord = [&](const std::string& record, bool carriageRecord, bool force) {
+        if (record.empty()) return;
+
+        const bool isProgress = carriageRecord &&
+            record.find("frame=") != std::string::npos &&
+            record.find("time=") != std::string::npos;
+        const bool isFinalProgress = record.find("Lsize=") != std::string::npos;
+        if (isProgress && !isFinalProgress && !force) {
+            const ULONGLONG now = GetTickCount64();
+            if (lastCarriageProgressTick && now - lastCarriageProgressTick < 1000) return;
+            lastCarriageProgressTick = now;
+        }
+
+        int n = MultiByteToWideChar(CP_ACP, 0, record.c_str(),
+            (int)record.size(), NULL, 0);
+        if (n <= 0) return;
+        std::wstring wline(n, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, record.c_str(),
+            (int)record.size(), &wline[0], n);
+
+        if (isProgress && task->expectedDurationMs > 0) {
+            const size_t timePos = record.find("time=");
+            int hours = 0, minutes = 0;
+            double seconds = 0.0;
+            if (timePos != std::string::npos &&
+                sscanf_s(record.c_str() + timePos + 5, "%d:%d:%lf",
+                    &hours, &minutes, &seconds) == 3) {
+                const double progressMs =
+                    ((hours * 60.0 + minutes) * 60.0 + seconds) * 1000.0;
+                const double percent = std::min(100.0,
+                    std::max(0.0, progressMs * 100.0 /
+                        (double)task->expectedDurationMs));
+                wchar_t prefix[64]{};
+                swprintf_s(prefix, L"Progress %.1f%%  ", percent);
+                wline.insert(0, prefix);
+            }
+        }
+
+        wline += L"\r\n";
+        PostFfmpegOutput(task, wline);
+        };
 
     while (ReadFile(hRead, buf, sizeof(buf), &bytes, NULL) && bytes > 0) {
         accum.append(buf, buf + bytes);
-        size_t pos = 0;
         while (true) {
-            size_t nl = accum.find('\n', pos);
-            if (nl == std::string::npos) {
-                accum.erase(0, pos);
-                break;
-            }
-            std::string line = accum.substr(pos, nl - pos + 1);
-            pos = nl + 1;
+            const size_t cr = accum.find('\r');
+            const size_t lf = accum.find('\n');
+            size_t delimiter = std::string::npos;
+            if (cr != std::string::npos && lf != std::string::npos)
+                delimiter = std::min(cr, lf);
+            else if (cr != std::string::npos)
+                delimiter = cr;
+            else
+                delimiter = lf;
+            if (delimiter == std::string::npos) break;
 
-            int n = MultiByteToWideChar(CP_ACP, 0, line.c_str(), (int)line.size(), NULL, 0);
-            if (n <= 0) continue;
-            std::wstring wline(n, L'\0');
-            MultiByteToWideChar(CP_ACP, 0, line.c_str(), (int)line.size(), &wline[0], n);
-            PostFfmpegOutput(task, wline);
+            const bool carriageRecord = accum[delimiter] == '\r';
+            std::string record = accum.substr(0, delimiter);
+            size_t consumed = delimiter + 1;
+            while (consumed < accum.size() &&
+                (accum[consumed] == '\r' || accum[consumed] == '\n')) {
+                ++consumed;
+            }
+            accum.erase(0, consumed);
+            emitPipeRecord(record, carriageRecord, false);
         }
     }
+    if (!accum.empty()) emitPipeRecord(accum, false, true);
     CloseHandle(hRead);
 
     WaitForSingleObject(task->hProcess, INFINITE);
@@ -1345,20 +1551,35 @@ static DWORD WINAPI FfmpegThreadProc(LPVOID param) {
 
     task->exitCode = exitCode;
 
-    // On success, rename outputTemp -> inputCopy (so finalWorking is the "base.ext" in video_process)
+    // Keep the encoded file under its operation-specific name until playback exits.
+    // Finalization then publishes it beside the source file.
     if (exitCode == 0) {
-        // Delete original copy, then rename
-        DeleteFileW(task->inputCopy.c_str());
-        MoveFileExW(task->outputTemp.c_str(), task->inputCopy.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
-        task->finalWorking = task->inputCopy;
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        bool haveOutput = GetFileAttributesExW(task->outputTemp.c_str(), GetFileExInfoStandard, &fad) &&
+            (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        ULARGE_INTEGER size{};
+        if (haveOutput) {
+            size.HighPart = fad.nFileSizeHigh;
+            size.LowPart = fad.nFileSizeLow;
+            haveOutput = size.QuadPart > 0;
+        }
+
+        if (haveOutput) {
+            task->finalWorking = task->outputTemp;
+            DeleteFileW(task->inputCopy.c_str());
+        }
+        else {
+            task->exitCode = ERROR_FILE_NOT_FOUND;
+            PostFfmpegOutput(task,
+                L"ERROR: FFmpeg reported success but did not create a usable output file.\r\n");
+        }
     }
 
     task->running = false;
     task->done = true;
-    PostMessageW(g_hwndMain, WM_APP_FFMPEG_DONE, (WPARAM)task, (LPARAM)exitCode);
+    PostMessageW(g_hwndMain, WM_APP_FFMPEG_DONE, (WPARAM)task, (LPARAM)task->exitCode);
     LogLine(L"FFmpegTask done: src=\"%s\" exitCode=%lu finalWorking=\"%s\"",
-        task->sourceFull.c_str(), exitCode, task->finalWorking.c_str());
+        task->sourceFull.c_str(), task->exitCode, task->finalWorking.c_str());
     return 0;
 }
 
@@ -2018,9 +2239,11 @@ static void LoadConfigFromIni() {
     // after the while(...) loop
     InitLoggingFromConfig();
     // derive executable overrides
-    g_ffmpegExeW = g_cfg.ffmpegPath.empty() ? L"ffmpeg" : g_cfg.ffmpegPath;
-    g_ffprobeExeW = g_cfg.ffprobePath.empty() ? L"ffprobe" : g_cfg.ffprobePath;
-    g_ffmpegExeA = g_cfg.ffmpegPath.empty() ? "ffmpeg" : NarrowFromWideACP(g_cfg.ffmpegPath);
+    g_ffmpegExeW = g_cfg.ffmpegPath.empty()
+        ? DefaultMediaToolPath(L"ffmpeg.exe") : g_cfg.ffmpegPath;
+    g_ffprobeExeW = g_cfg.ffprobePath.empty()
+        ? DefaultMediaToolPath(L"ffprobe.exe") : g_cfg.ffprobePath;
+    g_ffmpegExeA = NarrowFromWideACP(g_ffmpegExeW);
     
     if (g_cfg.loggingEnabled)
     {
@@ -2137,7 +2360,9 @@ static void ShowHelp() {
         }
         msg += L"\n"
             L"  At end of playback, if FFmpeg tasks are still running,\n"
-            L"  the title bar shows \"waiting on N task(s)\" until they all complete.\n";
+            L"  the title bar shows \"waiting on N task(s)\" until they all complete.\n"
+            L"  Results are saved beside the source with _trimfront, _trimend, or _hflip.\n"
+            L"  A feedback window opens for every task when playback exits.\n";
     }
 
     MessageBoxW(g_hwndMain, msg.c_str(), L"Media Explorer - Help", MB_OK);
@@ -2151,6 +2376,11 @@ static void ShowHelp() {
 // ----------------------------- ListView helpers
 static void LV_ResetColumns()
 {
+    // A full view rebuild cancels any in-progress "New Folder" label edit.
+    g_pendingNewFolderRenamePath.clear();
+    g_newFolderReselectPath.clear();
+    g_refreshAfterNewFolderRename = false;
+
     ListView_DeleteAllItems(g_hwndList);
     while (ListView_DeleteColumn(g_hwndList, 0)) {}
 
@@ -4772,103 +5002,181 @@ static void ToggleFullscreen() {
     if (g_hwndVideo) SetFocus(g_hwndVideo);
 }
 
+static void CleanupFfmpegTaskDirectory(const std::wstring& directory) {
+    if (directory.empty()) return;
+
+    std::wstring dir = EnsureSlash(directory);
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring full = dir + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) {
+                SetFileAttributesW(full.c_str(), fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+            }
+            if (!DeleteFileW(full.c_str())) {
+                LogLine(L"FFmpeg cleanup could not delete \"%s\" err=%lu",
+                    full.c_str(), GetLastError());
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    std::wstring taskDir = dir;
+    while (taskDir.size() > 3 &&
+        (taskDir.back() == L'\\' || taskDir.back() == L'/')) {
+        taskDir.pop_back();
+    }
+    if (!RemoveDirectoryW(taskDir.c_str()) && DirExistsW(taskDir)) {
+        LogLine(L"FFmpeg cleanup could not remove \"%s\" err=%lu",
+            taskDir.c_str(), GetLastError());
+    }
+}
+
 static void FinalizeAllFfmpegTasks() {
-    std::vector<std::wstring> dirsToDelete;
-
+    std::vector<FfmpegTask*> tasks;
     EnterCriticalSection(&g_ffLock);
-    for (FfmpegTask* t : g_ffTasks) {
-        if (!t) continue;
+    tasks = g_ffTasks;
+    LeaveCriticalSection(&g_ffLock);
 
+    int publishedCount = 0;
+    int failedCount = 0;
+
+    for (FfmpegTask* t : tasks) {
+        if (!t || t->finalized) continue;
+        t->finalized = true;
+
+        if (t->hThread) {
+            WaitForSingleObject(t->hThread, INFINITE);
+            CloseHandle(t->hThread);
+            t->hThread = NULL;
+        }
+
+        bool cleanWorkingDirectory = false;
         if (t->exitCode == 0 && !t->finalWorking.empty()) {
-            std::wstring src = t->finalWorking;
-
-            std::wstring parent = t->workingDir;
-            if (!parent.empty() && (parent.back() == L'\\' || parent.back() == L'/')) parent.pop_back();
-            PathRemoveFileSpecW(&parent[0]);
-            parent = parent.c_str();
-            parent = EnsureSlash(parent);
-
-            const wchar_t* base = wcsrchr(src.c_str(), L'\\');
-            base = base ? base + 1 : src.c_str();
+            const std::wstring parent = FolderOfFileWithSlash(t->sourceFull);
+            const wchar_t* sourceBase = wcsrchr(t->sourceFull.c_str(), L'\\');
+            sourceBase = sourceBase ? sourceBase + 1 : t->sourceFull.c_str();
 
             wchar_t fname[_MAX_FNAME] = {}, ext[_MAX_EXT] = {};
-            _wsplitpath_s(base, NULL, 0, NULL, 0, fname, _MAX_FNAME, ext, _MAX_EXT);
+            _wsplitpath_s(sourceBase, NULL, 0, NULL, 0,
+                fname, _MAX_FNAME, ext, _MAX_EXT);
 
-            std::wstring dst = UniqueName(parent, fname, ext);
-            if (MoveFileExW(src.c_str(), dst.c_str(),
-                MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING))
-            {
+            std::wstring outputBase = fname;
+            outputBase += FfmpegOpFileSuffix(t->kind);
+            std::wstring dst = UniqueName(parent, outputBase, ext);
+
+            if (MoveFileExW(t->finalWorking.c_str(), dst.c_str(),
+                MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+                t->publishedFull = dst;
+                t->publishSucceeded = true;
                 g_newFilesFromPlayback.push_back(dst);
+                ++publishedCount;
+                cleanWorkingDirectory = true;
+
+                std::wstring message = L"\r\nSUCCESS: Output saved to:\r\n  ";
+                message += dst;
+                message += L"\r\n";
+                AppendFfmpegOutputNow(t, message);
+                UpdateFfmpegWindowTitle(t, L"(complete)");
+                LogLine(L"FFmpegTask published: src=\"%s\" dst=\"%s\"",
+                    t->finalWorking.c_str(), dst.c_str());
             }
-            else
-            {
-                DWORD err = GetLastError();
-                LogLine(L"FinalizeAllFfmpegTasks: MoveFileEx failed src=\"%s\" dst=\"%s\" err=%lu",
-                    src.c_str(), dst.c_str(), err);
+            else {
+                DWORD error = GetLastError();
+                ++failedCount;
+
+                std::wstring message = L"\r\nERROR: Could not move the finished output into the source folder.\r\n";
+                message += Win32ErrorText(error);
+                message += L"\r\n\r\nThe encoded file was preserved here:\r\n  ";
+                message += t->finalWorking;
+                message += L"\r\n";
+                AppendFfmpegOutputNow(t, message);
+                UpdateFfmpegWindowTitle(t, L"(publish failed)");
+                LogLine(L"FFmpegTask publish failed: src=\"%s\" dst=\"%s\" err=%lu",
+                    t->finalWorking.c_str(), dst.c_str(), error);
             }
         }
+        else {
+            ++failedCount;
+            cleanWorkingDirectory = true;
 
-        if (!t->workingDir.empty())
-            dirsToDelete.push_back(t->workingDir);
-    }
-    LeaveCriticalSection(&g_ffLock);
-
-    std::sort(dirsToDelete.begin(), dirsToDelete.end());
-    dirsToDelete.erase(std::unique(dirsToDelete.begin(), dirsToDelete.end()), dirsToDelete.end());
-
-    for (const auto& dir : dirsToDelete) {
-        std::wstring pattern = EnsureSlash(dir) + L"*";
-        WIN32_FIND_DATAW fd{};
-        HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-                std::wstring full = EnsureSlash(dir) + fd.cFileName;
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    continue;
-                }
-                DeleteFileW(full.c_str());
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
+            std::wstring message = L"\r\nFAILED: FFmpeg did not produce an output (code ";
+            message += std::to_wstring(t->exitCode);
+            message += L").\r\n";
+            AppendFfmpegOutputNow(t, message);
+            UpdateFfmpegWindowTitle(t, L"(failed)");
         }
-        RemoveDirectoryW(dir.c_str());
+
+        if (cleanWorkingDirectory && t->workingDirCreated) {
+            CleanupFfmpegTaskDirectory(t->workingDir);
+        }
     }
 
-    EnterCriticalSection(&g_ffLock);
-    for (FfmpegTask* t : g_ffTasks) {
-        if (!t) continue;
-        if (t->hProcess) CloseHandle(t->hProcess);
-        if (t->hThread) CloseHandle(t->hThread);
-        delete t;
+    if (publishedCount > 0 || failedCount > 0) {
+        std::wstring status = L"FFmpeg: " + std::to_wstring(publishedCount) + L" output(s) created";
+        if (failedCount > 0) {
+            status += L", " + std::to_wstring(failedCount) + L" failed";
+        }
+        status += L". See the feedback window(s).";
+        StatusBarSetText(status);
     }
-    g_ffTasks.clear();
-    LeaveCriticalSection(&g_ffLock);
 }
 
 static void WaitForFfmpegTasksAndFinalize() {
     EnterCriticalSection(&g_ffLock);
-    bool anyTasks = !g_ffTasks.empty();
+    bool anyTasks = false;
+    for (FfmpegTask* t : g_ffTasks) {
+        if (t && !t->finalized) {
+            anyTasks = true;
+            break;
+        }
+    }
     LeaveCriticalSection(&g_ffLock);
     if (!anyTasks) return;
 
-    auto countRunning = []() -> int {
+    auto countUnfinishedThreads = []() -> int {
         int c = 0;
         EnterCriticalSection(&g_ffLock);
         for (FfmpegTask* t : g_ffTasks) {
-            if (t && t->running) ++c;
+            if (!t || t->finalized || !t->hThread) continue;
+            if (WaitForSingleObject(t->hThread, 0) == WAIT_TIMEOUT) ++c;
         }
         LeaveCriticalSection(&g_ffLock);
         return c;
         };
 
-    int remaining = countRunning();
+    int remaining = countUnfinishedThreads();
     if (remaining > 0) {
+        std::vector<FfmpegTask*> unfinishedTasks;
+        EnterCriticalSection(&g_ffLock);
+        for (FfmpegTask* t : g_ffTasks) {
+            if (t && !t->finalized && t->hThread &&
+                WaitForSingleObject(t->hThread, 0) == WAIT_TIMEOUT) {
+                unfinishedTasks.push_back(t);
+            }
+        }
+        LeaveCriticalSection(&g_ffLock);
+
+        for (FfmpegTask* t : unfinishedTasks) {
+            AppendFfmpegOutputNow(t,
+                L"\r\nPlayback has exited; this operation is still encoding. "
+                L"Live progress follows.\r\n");
+            UpdateFfmpegWindowTitle(t, L"(finishing - live progress)");
+        }
+
+        const ULONGLONG waitStarted = GetTickCount64();
         for (;;) {
-            remaining = countRunning();
+            remaining = countUnfinishedThreads();
             if (remaining <= 0) break;
 
-            wchar_t buf[256];
-            swprintf_s(buf, L"Media Explorer - waiting on %d FFmpeg task(s)...", remaining);
+            const ULONGLONG elapsedSeconds = (GetTickCount64() - waitStarted) / 1000;
+            wchar_t buf[320];
+            swprintf_s(buf,
+                L"Media Explorer - waiting on %d FFmpeg task(s) - %llum %02llus elapsed - see progress windows",
+                remaining, elapsedSeconds / 60, elapsedSeconds % 60);
             SetWindowTextW(g_hwndMain, buf);
 
             MSG msg;
@@ -4880,12 +5188,27 @@ static void WaitForFfmpegTasksAndFinalize() {
         }
     }
 
+    // Every worker is now joined-able. Drain its queued text/completion messages
+    // before appending the final publish result, so SUCCESS/FAILED stays last.
+    MSG ffMsg{};
+    while (PeekMessageW(&ffMsg, g_hwndMain,
+        WM_APP_FFMPEG_OUTPUT, WM_APP_FFMPEG_DONE, PM_REMOVE)) {
+        TranslateMessage(&ffMsg);
+        DispatchMessageW(&ffMsg);
+    }
+
     FinalizeAllFfmpegTasks();
+
+    // WM_CLOSE on a running feedback window hides it and marks it for restore.
+    // Reveal it now so the final success/error text referenced by the status
+    // bar is always reachable.
+    RestoreLogWindowsAfterPlayback();
 }
 
 static void ExitPlayback() {
     LogLine(L"ExitPlayback called: inPlayback=%d", g_inPlayback ? 1 : 0);
-    if (!g_inPlayback) return;
+    if (!g_inPlayback || g_exitingPlayback) return;
+    g_exitingPlayback = true;
 
     g_newFilesFromPlayback.clear();
 
@@ -4900,6 +5223,10 @@ static void ExitPlayback() {
     hadFfmpegTasks = !g_ffTasks.empty();
     LeaveCriticalSection(&g_ffLock);
 
+    // Make every queued operation visible as soon as playback exits.  If an
+    // encode is still finishing, its live log remains on screen while the
+    // wait loop pumps worker output and completion messages.
+    RestoreLogWindowsAfterPlayback();
     WaitForFfmpegTasksAndFinalize();
 
     g_inPlayback = false;
@@ -4909,7 +5236,7 @@ static void ExitPlayback() {
     ApplyPostActionsAndRefresh(hadFfmpegTasks);
     SetTitleFolderOrDrives();
     LogLine(L"ExitPlayback finished");
-    RestoreLogWindowsAfterPlayback();
+    g_exitingPlayback = false;
 }
 
 static void NextInPlaylist() {
@@ -5790,6 +6117,13 @@ static DWORD WINAPI FileOpThreadProc(LPVOID param) {
 // Helper: refresh current view without forcing a specific folder
 static void RefreshCurrentView() {
     if (g_inPlayback) return;
+    if (!g_pendingNewFolderRenamePath.empty() ||
+        (g_hwndList && ListView_GetEditControl(g_hwndList))) {
+        g_refreshAfterNewFolderRename = true;
+        return;
+    }
+
+    g_refreshAfterNewFolderRename = false;
     if (g_view == ViewKind::Search && g_search.active) {
         std::vector<Row> res;
         RunSearchFromOrigin(res);
@@ -6763,10 +7097,10 @@ static std::wstring UniqueFolderPath(const std::wstring& folder, const std::wstr
         if (!PathFileExistsW(candidate.c_str())) return candidate;
     }
 
-    return target;
+    return L"";
 }
 
-static void SelectPathInCurrentList(const std::wstring& fullPath) {
+static int SelectPathInCurrentList(const std::wstring& fullPath) {
     std::wstring targetDir = EnsureSlash(fullPath);
     for (int i = 0; i < (int)g_rows.size(); ++i) {
         std::wstring rowPath = g_rows[i].isDir ? EnsureSlash(g_rows[i].full) : g_rows[i].full;
@@ -6776,26 +7110,197 @@ static void SelectPathInCurrentList(const std::wstring& fullPath) {
                 LVIS_SELECTED | LVIS_FOCUSED,
                 LVIS_SELECTED | LVIS_FOCUSED);
             ListView_EnsureVisible(g_hwndList, i, FALSE);
-            return;
+            return i;
         }
     }
+    return -1;
+}
+
+static std::wstring Win32ErrorText(DWORD error) {
+    LPWSTR raw = nullptr;
+    DWORD chars = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, error, 0, reinterpret_cast<LPWSTR>(&raw), 0, nullptr);
+
+    std::wstring text;
+    if (chars && raw) text.assign(raw, chars);
+    if (raw) LocalFree(raw);
+
+    while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' ||
+        text.back() == L' ' || text.back() == L'\t')) {
+        text.pop_back();
+    }
+    if (text.empty()) text = L"Windows error " + std::to_wstring(error);
+    return text;
+}
+
+static bool IsReservedWindowsFolderName(const std::wstring& name) {
+    size_t dot = name.find(L'.');
+    std::wstring stem = name.substr(0, dot);
+    std::transform(stem.begin(), stem.end(), stem.begin(),
+        [](wchar_t ch) { return (wchar_t)towupper(ch); });
+
+    if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL" ||
+        stem == L"CONIN$" || stem == L"CONOUT$") {
+        return true;
+    }
+
+    return stem.size() == 4 &&
+        (stem.compare(0, 3, L"COM") == 0 || stem.compare(0, 3, L"LPT") == 0) &&
+        stem[3] >= L'1' && stem[3] <= L'9';
+}
+
+static bool ValidateNewFolderName(const std::wstring& name, std::wstring& outError) {
+    if (name.empty() ||
+        std::all_of(name.begin(), name.end(), [](wchar_t ch) { return iswspace(ch) != 0; })) {
+        outError = L"Enter a folder name.";
+        return false;
+    }
+    if (name == L"." || name == L"..") {
+        outError = L"That folder name is not allowed.";
+        return false;
+    }
+    if (name.front() == L' ') {
+        outError = L"Folder names cannot begin with a space.";
+        return false;
+    }
+    if (name.back() == L' ' || name.back() == L'.') {
+        outError = L"Folder names cannot end with a space or period.";
+        return false;
+    }
+    for (wchar_t ch : name) {
+        if (ch < 32 || wcschr(L"<>:\"/\\|?*", ch)) {
+            outError = L"A folder name cannot contain any of these characters:\n"
+                L"\\ / : * ? \" < > |";
+            return false;
+        }
+    }
+    if (IsReservedWindowsFolderName(name)) {
+        outError = L"That name is reserved by Windows. Choose a different folder name.";
+        return false;
+    }
+    return true;
+}
+
+static bool IsPendingNewFolderRenameRow(int index) {
+    if (g_pendingNewFolderRenamePath.empty() ||
+        g_view != ViewKind::Folder ||
+        index < 0 || index >= (int)g_rows.size() ||
+        !g_rows[index].isDir) {
+        return false;
+    }
+
+    std::wstring rowPath = TrimTrailingSlashForCmd(g_rows[index].full);
+    return _wcsicmp(rowPath.c_str(), g_pendingNewFolderRenamePath.c_str()) == 0;
+}
+
+static void RetryPendingNewFolderRename(const std::wstring& error) {
+    MessageBoxW(g_hwndMain, error.c_str(), L"Rename Folder", MB_OK | MB_ICONERROR);
+    PostMessageW(g_hwndMain, WM_APP_BEGIN_NEW_FOLDER_RENAME, 0, 0);
+}
+
+static void EndPendingNewFolderRename(std::wstring reselectPath, bool resort) {
+    g_pendingNewFolderRenamePath.clear();
+    if (resort || g_refreshAfterNewFolderRename) {
+        g_newFolderReselectPath = reselectPath;
+        PostMessageW(g_hwndMain, WM_APP_FINISH_NEW_FOLDER_RENAME, 0, 0);
+    }
+}
+
+static void BeginPendingNewFolderRename() {
+    if (g_pendingNewFolderRenamePath.empty() ||
+        g_view != ViewKind::Folder ||
+        g_inPlayback) {
+        EndPendingNewFolderRename(L"", false);
+        return;
+    }
+
+    int index = SelectPathInCurrentList(g_pendingNewFolderRenamePath);
+    if (!IsPendingNewFolderRenameRow(index)) {
+        EndPendingNewFolderRename(L"", false);
+        return;
+    }
+
+    SetFocus(g_hwndList);
+    HWND edit = ListView_EditLabel(g_hwndList, index);
+    if (!edit) {
+        EndPendingNewFolderRename(g_pendingNewFolderRenamePath, false);
+        return;
+    }
+    SendMessageW(edit, EM_SETSEL, 0, -1);
+}
+
+static bool CommitPendingNewFolderRename(int index, const wchar_t* editedText) {
+    if (!IsPendingNewFolderRenameRow(index)) return false;
+
+    if (!editedText) {
+        EndPendingNewFolderRename(g_pendingNewFolderRenamePath, false);
+        return false;
+    }
+
+    std::wstring newName = editedText;
+    std::wstring validationError;
+    if (!ValidateNewFolderName(newName, validationError)) {
+        RetryPendingNewFolderRename(validationError);
+        return false;
+    }
+
+    const std::wstring oldPath = g_pendingNewFolderRenamePath;
+    const std::wstring newPath = EnsureSlash(g_folder) + newName;
+
+    if (_wcsicmp(oldPath.c_str(), newPath.c_str()) != 0 &&
+        PathFileExistsW(newPath.c_str())) {
+        RetryPendingNewFolderRename(
+            L"A file or folder with that name already exists in this location.");
+        return false;
+    }
+
+    if (oldPath != newPath && !MoveFileW(oldPath.c_str(), newPath.c_str())) {
+        DWORD error = GetLastError();
+        std::wstring message = L"Could not rename the folder.\n\n";
+        message += Win32ErrorText(error);
+        RetryPendingNewFolderRename(message);
+        return false;
+    }
+
+    Row& row = g_rows[index];
+    row.name = newName;
+    row.full = EnsureSlash(newPath);
+
+    EndPendingNewFolderRename(newPath, true);
+    StatusBarSetText(L"Created folder: " + newName);
+    return true;
 }
 
 static void Browser_CreateNewFolder() {
     if (g_view != ViewKind::Folder || g_folder.empty()) return;
 
     std::wstring target = UniqueFolderPath(g_folder, L"New Folder");
+    if (target.empty()) {
+        MessageBoxW(g_hwndMain,
+            L"Could not find an available name for a new folder.",
+            L"New Folder", MB_OK | MB_ICONERROR);
+        return;
+    }
+
     int rc = SHCreateDirectoryExW(g_hwndMain, target.c_str(), NULL);
-    if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && !DirExistsW(target)) {
-        wchar_t buf[512];
-        swprintf_s(buf, L"Failed to create folder:\n%s\n\nError: %d", target.c_str(), rc);
-        MessageBoxW(g_hwndMain, buf, L"New Folder", MB_OK | MB_ICONERROR);
+    if (rc != ERROR_SUCCESS) {
+        std::wstring message = L"Failed to create folder:\n";
+        message += target;
+        message += L"\n\n";
+        message += Win32ErrorText((DWORD)rc);
+        MessageBoxW(g_hwndMain, message.c_str(), L"New Folder", MB_OK | MB_ICONERROR);
         return;
     }
 
     ShowFolder(g_folder);
-    SelectPathInCurrentList(target);
+    int index = SelectPathInCurrentList(target);
     StatusBarSetText(L"Created folder: " + BaseNameOnly(target));
+
+    if (index >= 0) {
+        g_pendingNewFolderRenamePath = target;
+        PostMessageW(g_hwndMain, WM_APP_BEGIN_NEW_FOLDER_RENAME, 0, 0);
+    }
 }
 
 static POINT ListContextMenuPoint(LPARAM lParam) {
@@ -7012,9 +7517,32 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
             L"FFmpeg tools", MB_OK);
         return;
     }
-    if (!g_inPlayback || g_playlist.empty() || !g_mp) return;
+    if (!g_inPlayback || g_exitingPlayback || g_playlist.empty() || !g_mp) return;
 
     const std::wstring& cur = g_playlist[g_playlistIndex];
+
+    // A repeated click for the same operation used to launch another worker
+    // against the same temporary files. Keep one pending operation instead.
+    FfmpegTask* existingTask = nullptr;
+    EnterCriticalSection(&g_ffLock);
+    for (FfmpegTask* t : g_ffTasks) {
+        if (t && !t->finalized && t->kind == kind &&
+            _wcsicmp(t->sourceFull.c_str(), cur.c_str()) == 0) {
+            existingTask = t;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ffLock);
+
+    if (existingTask) {
+        PostFfmpegOutput(existingTask,
+            L"\r\nDuplicate request ignored; this operation is already queued.\r\n");
+        MessageBoxW(g_hwndMain,
+            L"That operation is already queued for this video.\n\n"
+            L"Its feedback window will appear when playback exits.",
+            L"FFmpeg task already queued", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
 
     // Get current playback time in ms
     libvlc_time_t refMs = libvlc_media_player_get_time(g_mp);
@@ -7026,7 +7554,12 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
     folder = folder.c_str(); // shrink
     folder = EnsureSlash(folder);
 
-    std::wstring workingDir = folder + L"video_process\\";
+    const uint64_t taskSerial = g_ffTaskSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::wstring workingRoot = folder + L"video_process\\";
+    std::wstring workingDir = workingRoot + L"task_" +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64()) + L"_" +
+        std::to_wstring(taskSerial) + L"\\";
 
     const wchar_t* baseName = wcsrchr(cur.c_str(), L'\\');
     baseName = baseName ? baseName + 1 : cur.c_str();
@@ -7040,11 +7573,7 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
 
     std::wstring outputTemp = workingDir;
     outputTemp += fname;
-    switch (kind) {
-    case FfmpegOpKind::TrimFront: outputTemp += L"_trimfront"; break;
-    case FfmpegOpKind::TrimEnd:   outputTemp += L"_trimend";   break;
-    case FfmpegOpKind::HFlip:     outputTemp += L"_hflip";     break;
-    }
+    outputTemp += FfmpegOpFileSuffix(kind);
     outputTemp += ext;
 
     FfmpegTask* task = new FfmpegTask();
@@ -7055,6 +7584,22 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
     task->refMs = refMs;
     task->kind = kind;
     task->running = true;
+
+    const libvlc_time_t sourceDurationMs = libvlc_media_player_get_length(g_mp);
+    if (sourceDurationMs > 0) {
+        switch (kind) {
+        case FfmpegOpKind::TrimFront:
+            task->expectedDurationMs = std::max<libvlc_time_t>(0,
+                sourceDurationMs - refMs);
+            break;
+        case FfmpegOpKind::TrimEnd:
+            task->expectedDurationMs = std::min(sourceDurationMs, refMs);
+            break;
+        case FfmpegOpKind::HFlip:
+            task->expectedDurationMs = sourceDurationMs;
+            break;
+        }
+    }
 
     LogLine(L"FFmpegTask scheduled: kind=%d src=\"%s\" refMs=%lld workingDir=\"%s\"",
         (int)kind, cur.c_str(), (long long)refMs, workingDir.c_str());
@@ -7076,6 +7621,24 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
         return;
     }
     task->hwnd = logWnd;
+
+    std::wstring queued = L"Queued while playback is active.\r\n"
+        L"The result will be saved beside the source when playback exits.\r\n"
+        L"Output name: ";
+    queued += fname;
+    queued += FfmpegOpFileSuffix(kind);
+    queued += ext;
+    queued += L"\r\n";
+    if (task->expectedDurationMs > 0) {
+        const long long totalSeconds = task->expectedDurationMs / 1000;
+        wchar_t duration[64]{};
+        swprintf_s(duration, L"Media duration: %lld:%02lld:%02lld\r\n",
+            totalSeconds / 3600, (totalSeconds / 60) % 60, totalSeconds % 60);
+        queued += duration;
+    }
+    queued += L"Live FFmpeg progress will appear here when playback exits.\r\n\r\n";
+    AppendFfmpegOutputNow(task, queued);
+    UpdateFfmpegWindowTitle(task, L"(running)");
 
     EnterCriticalSection(&g_ffLock);
     g_ffTasks.push_back(task);
@@ -7109,6 +7672,7 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     }
 
     if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && g_mp) {
+        if (g_exitingPlayback) return 0;
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
@@ -7388,7 +7952,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
         InitializeCriticalSection(&g_ffLock);   // NEW
 
         g_hwndList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
             0, 0, 100, 100, h, (HMENU)1001, g_hInst, NULL);
         ListView_SetExtendedListViewStyle(g_hwndList,
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES | LVS_EX_LABELTIP);
@@ -7435,6 +7999,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
     case WM_NOTIFY: {
         LPNMHDR nm = (LPNMHDR)l;
         if (nm->hwndFrom == g_hwndList) {
+            if (nm->code == LVN_BEGINLABELEDITW) {
+                NMLVDISPINFOW* info = reinterpret_cast<NMLVDISPINFOW*>(l);
+                return IsPendingNewFolderRenameRow(info->item.iItem) ? FALSE : TRUE;
+            }
+            if (nm->code == LVN_ENDLABELEDITW) {
+                NMLVDISPINFOW* info = reinterpret_cast<NMLVDISPINFOW*>(l);
+                return CommitPendingNewFolderRename(info->item.iItem, info->item.pszText)
+                    ? TRUE : FALSE;
+            }
             if (nm->code == NM_DBLCLK || nm->code == LVN_ITEMACTIVATE) {
                 ActivateSelection(); return 0;
             }
@@ -7452,6 +8025,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
             }
         }
         break;
+    }
+
+    case WM_APP_BEGIN_NEW_FOLDER_RENAME:
+        BeginPendingNewFolderRename();
+        return 0;
+
+    case WM_APP_FINISH_NEW_FOLDER_RENAME: {
+        std::wstring renamedPath;
+        renamedPath.swap(g_newFolderReselectPath);
+        const bool refresh = g_refreshAfterNewFolderRename;
+        g_refreshAfterNewFolderRename = false;
+
+        if (refresh) {
+            RefreshCurrentView();
+            if (!renamedPath.empty()) SelectPathInCurrentList(renamedPath);
+        }
+        else if (!renamedPath.empty() &&
+            g_view == ViewKind::Folder &&
+            SelectPathInCurrentList(renamedPath) >= 0) {
+            SortRows(g_sortCol, g_sortAsc);
+            SelectPathInCurrentList(renamedPath);
+        }
+        return 0;
     }
 
     case WM_HSCROLL:
@@ -7544,6 +8140,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
 
         const bool accept =
             (!g_inPlayback) &&
+            g_pendingNewFolderRenamePath.empty() &&
+            (!g_hwndList || !ListView_GetEditControl(g_hwndList)) &&
             (myGen == g_folderReloadGen.load(std::memory_order_relaxed)) &&
             (g_view == ViewKind::Folder) &&
             (_wcsicmp(g_folder.c_str(), folder.c_str()) == 0);
@@ -7626,12 +8224,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
     case WM_APP_FFMPEG_OUTPUT: {
         FfmpegTask* task = (FfmpegTask*)w;
         std::wstring* p = (std::wstring*)l;
-        if (task && task->hEdit && p) {
-            HWND edit = task->hEdit;
-            SendMessageW(edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-            SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)p->c_str());
-            SendMessageW(edit, EM_SCROLLCARET, 0, 0);
-        }
+        bool tracked = false;
+        EnterCriticalSection(&g_ffLock);
+        tracked = task &&
+            std::find(g_ffTasks.begin(), g_ffTasks.end(), task) != g_ffTasks.end();
+        LeaveCriticalSection(&g_ffLock);
+
+        if (tracked && p) AppendFfmpegOutputNow(task, *p);
         delete p;
         return 0;
     }
@@ -7639,11 +8238,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
     case WM_APP_FFMPEG_DONE: {
         FfmpegTask* task = (FfmpegTask*)w;
         DWORD exitCode = (DWORD)l;
-        UNREFERENCED_PARAMETER(exitCode);
 
+        bool tracked = false;
         EnterCriticalSection(&g_ffLock);
         for (FfmpegTask* t : g_ffTasks) {
             if (t == task) {
+                tracked = true;
                 t->running = false;
                 t->done = true;
                 t->exitCode = exitCode;
@@ -7651,6 +8251,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
             }
         }
         LeaveCriticalSection(&g_ffLock);
+
+        // ExitPlayback can observe running=false and finalize before this queued
+        // notification is dispatched. Do not overwrite the final result then.
+        if (tracked && !task->finalized) {
+            if (exitCode == 0) {
+                PostFfmpegOutput(task,
+                    L"\r\nEncoding complete. The output will be saved when playback exits.\r\n");
+                UpdateFfmpegWindowTitle(task, L"(ready for playback exit)");
+            }
+            else {
+                PostFfmpegOutput(task,
+                    L"\r\nEncoding failed. Details will be shown when playback exits.\r\n");
+                UpdateFfmpegWindowTitle(task, L"(failed)");
+            }
+        }
         return 0;
     }
 
@@ -7715,21 +8330,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
         }
 
         // Refresh only when NOT in playback (prevents messing with playback UI)
-        if (!g_inPlayback) {
-            if (g_view == ViewKind::Folder) {
-                ShowFolder(g_folder);
-            }
-            else if (g_view == ViewKind::Search && g_search.active) {
-                std::vector<Row> res;
-                RunSearchFromOrigin(res);
-                ShowSearchResults(res);
-            }
+        if (!g_inPlayback &&
+            (g_view == ViewKind::Folder ||
+                (g_view == ViewKind::Search && g_search.active))) {
+            RefreshCurrentView();
         }
 
         return 0;
     }
 
     case WM_CLOSE:
+        if (g_inPlayback) {
+            if (g_exitingPlayback) return 0;
+            // Publish queued FFmpeg outputs before allowing the application to close.
+            ExitPlayback();
+        }
         if (g_loadingFolder) {
             // Avoid tearing down the window while ShowFolder is mid-loop
             MessageBoxW(h, L"Loading folder... please wait.", L"Media Explorer", MB_OK);

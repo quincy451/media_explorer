@@ -29,6 +29,16 @@ bin/x64/Release/MediaExplorer.exe
 
 All required VLC runtime files are included.
 
+The optional trim, flip, combine, and extended-properties features use FFmpeg.
+Install its current Windows build with:
+
+```powershell
+winget install --id Gyan.FFmpeg --exact
+```
+
+When no explicit `ffmpeg_path` or `ffprobe_path` is configured, MediaExplorer
+uses WinGet's stable command links when available, then falls back to `PATH`.
+
 ## Running the Linux Application
 
 See [`linux/README.md`](linux/README.md) for Debian dependencies, source and
