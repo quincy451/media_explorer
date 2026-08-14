@@ -1,0 +1,37 @@
+[media_explorer]
+# Linux directory whose children are stable mount points for mapped shares.
+mapped_root = /mnt/media-explorer
+
+# Optional Windows-like labels and desktop connection URIs.  For example:
+# mapping_v = smb://video-server/media
+# mapping_x = smb://archive-server/videos
+#
+# A mapping is connected only if /mnt/media-explorer/<letter> is a real mount,
+# or if the URI has been mounted by the desktop under /run/user/<uid>/gvfs.
+# An empty placeholder directory is shown as disconnected. Double-clicking a
+# disconnected mapping opens its URI so the desktop can request credentials.
+
+# Leave empty to start at the mount/root view.
+start_path =
+
+ffprobe_available = true
+ffprobe_path = /usr/bin/ffprobe
+# Extra arguments are parsed with shell-style quoting but executed directly;
+# Media Explorer never invokes a shell for ffprobe.
+ffprobe_args =
+
+# Reserved for Linux FFmpeg tools and shown in Help/self-test. The core player
+# does not require this flag, but retaining it keeps config parity with Windows.
+ffmpeg_available = true
+ffmpeg_path = /usr/bin/ffmpeg
+ffmpeg_args =
+
+# libVLC 3 playback options. Hardware decoding can be added, for example:
+# vlc_args = --no-video-title-show --quiet --avcodec-hw=any
+vlc_args = --no-video-title-show --quiet
+
+video_extensions = mp4,mkv,mov,avi,wmv,m4v,ts,m2ts,webm,flv,rm
+show_hidden = false
+follow_symlinks = false
+metadata_prefetch_limit = 500
+use_trash = true

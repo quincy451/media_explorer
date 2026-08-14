@@ -1,6 +1,12 @@
 # MediaExplorer
 
-MediaExplorer is a Windows desktop application written in C++17 using Win32 and libVLC. This repository includes full source code, Visual Studio 2022 project files, and prebuilt binaries (EXE, DLLs, and VLC plugins) so the application can run without installing additional dependencies.
+MediaExplorer has separate native implementations for Windows and Linux:
+
+- The Windows edition is written in C++17 using Win32 and libVLC. Its source,
+  Visual Studio 2022 project files, and prebuilt runtime are at the repository
+  root.
+- The Linux edition is written in Python 3 using PyQt5 and libVLC. Its source,
+  tests, build scripts, installer, and documentation are under [`linux/`](linux/README.md).
 
 ## Features
 
@@ -13,7 +19,7 @@ MediaExplorer is a Windows desktop application written in C++17 using Win32 and 
 - Optional video combining if external tool is provided
 - Background worker windows for long operations
 
-## Running the Application
+## Running the Windows Application
 
 After downloading/cloning the repository, run:
 
@@ -22,6 +28,12 @@ bin/x64/Release/MediaExplorer.exe
 ```
 
 All required VLC runtime files are included.
+
+## Running the Linux Application
+
+See [`linux/README.md`](linux/README.md) for Debian dependencies, source and
+PyInstaller build commands, installation, mapped-drive configuration, and
+smoke tests.
 
 ## Building with Visual Studio 2022
 
@@ -51,9 +63,14 @@ loggingPath      = C:\mediaexplorer_logs
 ```
 media_explorer/
     README.md
-    main.cpp
+    MediaExplorer.cpp
     mediaexplorer.sln
     MediaExplorer.vcxproj
+    linux/
+        media_explorer.py
+        build.sh
+        install.sh
+        README.md
     vlclib/
         include/
         lib/
@@ -69,4 +86,3 @@ media_explorer/
 ## License
 
 Insert preferred license here (MIT recommended).
-

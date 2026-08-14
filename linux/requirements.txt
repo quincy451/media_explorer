@@ -1,0 +1,7 @@
+# Runtime Python packages.  On Debian/arm64, install PyQt5 with apt
+# (python3-pyqt5) and create the build venv with --system-site-packages.
+PyQt5>=5.15,<5.16
+python-vlc>=3.0.20,<4
+
+# Build-only (not needed when running the source):
+PyInstaller>=6.13,<7
