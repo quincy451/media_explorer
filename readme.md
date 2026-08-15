@@ -5,8 +5,9 @@ MediaExplorer has separate native implementations for Windows and Linux:
 - The Windows edition is written in C++17 using Win32 and libVLC. Its source,
   Visual Studio 2022 project files, and prebuilt runtime are at the repository
   root.
-- The Linux edition is written in Python 3 using PyQt5 and libVLC. Its source,
-  tests, build scripts, installer, and documentation are under [`linux/`](linux/README.md).
+- The Linux edition is written in C++17 using Qt 5 Widgets and libVLC. Its
+  source, GNU Make build, installer, and documentation are under
+  [`linux/`](linux/README.md).
 
 ## Features
 
@@ -16,8 +17,8 @@ MediaExplorer has separate native implementations for Windows and Linux:
 - Playlist playback using libVLC
 - Keyboard shortcuts for playback and file operations
 - Optional FFmpeg tools (trim, flip) if enabled in the configuration file
-- Optional video combining if external tool is provided
-- Background worker windows for long operations
+- Built-in FFmpeg video combining with stream-copy and H.264/AAC fallback
+- Background status, progress, and cancellation for long operations
 
 ## Running the Windows Application
 
@@ -41,9 +42,8 @@ uses WinGet's stable command links when available, then falls back to `PATH`.
 
 ## Running the Linux Application
 
-See [`linux/README.md`](linux/README.md) for Debian dependencies, source and
-PyInstaller build commands, installation, mapped-drive configuration, and
-smoke tests.
+See [`linux/README.md`](linux/README.md) for Debian dependencies, GNU Make
+build commands, installation, mapped-drive configuration, and smoke tests.
 
 ## Building with Visual Studio 2022
 
@@ -77,7 +77,10 @@ media_explorer/
     mediaexplorer.sln
     MediaExplorer.vcxproj
     linux/
-        media_explorer.py
+        Makefile
+        src/
+            main.cpp
+            MediaExplorerWindow.cpp
         build.sh
         install.sh
         README.md
@@ -95,4 +98,4 @@ media_explorer/
 
 ## License
 
-Insert preferred license here (MIT recommended).
+No license has been selected for this repository.

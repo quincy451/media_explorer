@@ -1,6 +1,5 @@
-.build-venv/
 build/
 dist/
+/mediaexplorer.ini
 __pycache__/
 *.py[cod]
-/mediaexplorer.ini

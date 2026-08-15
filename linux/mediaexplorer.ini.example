@@ -2,14 +2,18 @@
 # Linux directory whose children are stable mount points for mapped shares.
 mapped_root = /mnt/media-explorer
 
-# Optional Windows-like labels and desktop connection URIs.  For example:
-# mapping_v = smb://video-server/media
-# mapping_x = smb://archive-server/videos
+# Optional Windows-like labels and desktop connection URIs. Configure the
+# matching SMB shares used by this workstation (credentials are never stored):
+# mapping_g = smb://file-server.example/g
+# mapping_x = smb://file-server.example/x
+# mapping_y = smb://file-server.example/y
+# mapping_z = smb://file-server.example/z
 #
-# A mapping is connected only if /mnt/media-explorer/<letter> is a real mount,
-# or if the URI has been mounted by the desktop under /run/user/<uid>/gvfs.
-# An empty placeholder directory is shown as disconnected. Double-clicking a
-# disconnected mapping opens its URI so the desktop can request credentials.
+# A mapping is connected if /mnt/media-explorer/<letter> is a real mount, shown
+# as on demand if it is backed by autofs, or resolved through a desktop GVFS
+# mount under /run/user/<uid>/gvfs. An ordinary empty placeholder is shown as
+# disconnected. Double-clicking first probes the stable path asynchronously,
+# then opens its URI for desktop credentials only if that mount did not appear.
 
 # Leave empty to start at the mount/root view.
 start_path =
@@ -20,11 +24,22 @@ ffprobe_path = /usr/bin/ffprobe
 # Media Explorer never invokes a shell for ffprobe.
 ffprobe_args =
 
-# Reserved for Linux FFmpeg tools and shown in Help/self-test. The core player
-# does not require this flag, but retaining it keeps config parity with Windows.
+# FFmpeg playback tools and selected-video combine.
 ffmpeg_available = true
 ffmpeg_path = /usr/bin/ffmpeg
 ffmpeg_args =
+video_combine_available = true
+
+# Ctrl+V option 1 copies the current video here after playback. Leave empty to
+# hide that option.
+upscale_directory =
+
+# Ctrl+U (Topaz) and Ctrl+3 (IW3) publish video+JSON jobs here atomically.
+# Leave empty to show a clear "not configured" message.
+topaz_upscale_queue =
+
+# Optional diagnostics destination retained for Windows configuration parity.
+logging_path =
 
 # libVLC 3 playback options. Hardware decoding can be added, for example:
 # vlc_args = --no-video-title-show --quiet --avcodec-hw=any

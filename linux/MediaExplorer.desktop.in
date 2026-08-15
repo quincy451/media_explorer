@@ -4,10 +4,10 @@ Version=1.0
 Name=Media Explorer
 GenericName=Video File Browser
 Comment=Browse, search, manage, and play videos on local and mapped drives
-Exec=@EXEC@
+TryExec=@EXEC@
+Exec=env QT_QPA_PLATFORM=xcb "@EXEC@"
 Icon=@ICON@
 Terminal=false
 Categories=AudioVideo;Video;
 Keywords=video;media;vlc;files;playlist;
 StartupNotify=true
-MimeType=inode/directory;video/mp4;video/x-matroska;video/quicktime;video/x-msvideo;
