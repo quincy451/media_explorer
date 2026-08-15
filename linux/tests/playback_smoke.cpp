@@ -2,10 +2,12 @@
 #include "../src/MediaExplorerWindow.h"
 
 #include <QApplication>
+#include <QDialog>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QKeyEvent>
 #include <QMessageBox>
 #include <QSize>
 #include <QTemporaryDir>
@@ -170,6 +172,76 @@ bool waitForStopped(QApplication &application, MediaExplorerWindow &window, int 
     return false;
 }
 
+bool waitForState(QApplication &application, MediaExplorerWindow &window,
+                  libvlc_state_t expected, int timeoutMs, int &lastState) {
+    QElapsedTimer elapsed;
+    elapsed.start();
+    do {
+        application.processEvents(QEventLoop::AllEvents, 25);
+        lastState = window.playerStateForTest();
+        if (lastState == static_cast<int>(expected)) return true;
+        if (lastState == static_cast<int>(libvlc_Error) ||
+            lastState == static_cast<int>(libvlc_Stopped) ||
+            lastState == static_cast<int>(libvlc_Ended)) return false;
+        QThread::msleep(10);
+    } while (elapsed.elapsed() < timeoutMs);
+    return false;
+}
+
+void sendPlaybackKey(MediaExplorerWindow &window, int key,
+                     Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    QKeyEvent press(QEvent::KeyPress, key, modifiers);
+    QApplication::sendEvent(&window, &press);
+    QKeyEvent release(QEvent::KeyRelease, key, modifiers);
+    QApplication::sendEvent(&window, &release);
+}
+
+struct ModalObservation {
+    bool seen = false;
+    bool paused = false;
+    bool playedAfterPause = false;
+    QString title;
+    int lastState = -1;
+};
+
+ModalObservation openHelpAndObservePause(MediaExplorerWindow &window) {
+    ModalObservation observation;
+    QElapsedTimer totalElapsed;
+    QElapsedTimer pausedElapsed;
+    totalElapsed.start();
+
+    QTimer observer;
+    observer.setInterval(20);
+    QObject::connect(&observer, &QTimer::timeout, [&] {
+        QWidget *modal = QApplication::activeModalWidget();
+        if (!modal) return;
+        if (!observation.seen) {
+            observation.seen = true;
+            observation.title = modal->windowTitle();
+        }
+        observation.lastState = window.playerStateForTest();
+        if (observation.lastState == static_cast<int>(libvlc_Paused)) {
+            if (!observation.paused) pausedElapsed.start();
+            observation.paused = true;
+        } else if (observation.paused &&
+                   observation.lastState == static_cast<int>(libvlc_Playing)) {
+            observation.playedAfterPause = true;
+        }
+
+        // Hold the real modal open long enough to prove the paused state is
+        // stable, while retaining a hard timeout so a regression cannot hang CI.
+        if ((observation.paused && pausedElapsed.elapsed() >= 250) ||
+            totalElapsed.elapsed() >= 2500) {
+            if (auto *dialog = qobject_cast<QDialog *>(modal)) dialog->reject();
+            else modal->close();
+        }
+    });
+    observer.start();
+    sendPlaybackKey(window, Qt::Key_F1);
+    observer.stop();
+    return observation;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -235,9 +307,11 @@ int main(int argc, char **argv) {
         application.processEvents();
 
         QString unexpectedDialog;
+        bool expectedModal = false;
         QTimer dialogGuard;
         dialogGuard.setInterval(50);
-        QObject::connect(&dialogGuard, &QTimer::timeout, [&unexpectedDialog] {
+        QObject::connect(&dialogGuard, &QTimer::timeout, [&unexpectedDialog, &expectedModal] {
+            if (expectedModal) return;
             QWidget *modal = QApplication::activeModalWidget();
             if (!modal) return;
             unexpectedDialog = modal->windowTitle();
@@ -272,6 +346,86 @@ int main(int argc, char **argv) {
                                << " Playing " << result.size.width() << 'x'
                                << result.size.height() << '\n';
                 standardOutput.flush();
+            }
+
+            if (failures == 0 && cycle == 1) {
+                const QString initialTitle = window.windowTitle();
+                if (!initialTitle.startsWith(QStringLiteral("(Single File)")) ||
+                    !initialTitle.contains(QFileInfo(clipPath).fileName()) ||
+                    !initialTitle.contains(QStringLiteral(" / "))) {
+                    standardError << "playback-smoke: playback title is incomplete: "
+                                  << initialTitle << '\n';
+                    ++failures;
+                }
+
+                sendPlaybackKey(window, Qt::Key_Z, Qt::ControlModifier);
+                application.processEvents();
+                const QString zoomedTitle = window.windowTitle();
+                if (!zoomedTitle.contains(QStringLiteral("[Zoom 125%]"))) {
+                    standardError << "playback-smoke: 125% zoom is missing from title: "
+                                  << zoomedTitle << '\n';
+                    ++failures;
+                }
+                sendPlaybackKey(window, Qt::Key_X, Qt::ControlModifier);
+                application.processEvents();
+                const QString fitTitle = window.windowTitle();
+                if (fitTitle.contains(QStringLiteral("[Zoom "))) {
+                    standardError << "playback-smoke: fit title retained a zoom marker: "
+                                  << fitTitle << '\n';
+                    ++failures;
+                }
+
+                expectedModal = true;
+                const ModalObservation playingModal = openHelpAndObservePause(window);
+                expectedModal = false;
+                int restoredState = window.playerStateForTest();
+                const bool resumed = waitForState(application, window, libvlc_Playing, 2500,
+                                                  restoredState);
+                if (!playingModal.seen ||
+                    playingModal.title != QStringLiteral("Media Explorer Help") ||
+                    !playingModal.paused || playingModal.playedAfterPause || !resumed) {
+                    standardError << "playback-smoke: Playing -> Help pause/restore failed: seen="
+                                  << playingModal.seen << ", title=" << playingModal.title
+                                  << ", modal-state=" << stateName(playingModal.lastState)
+                                  << ", replayed-in-modal=" << playingModal.playedAfterPause
+                                  << ", restored-state=" << stateName(restoredState) << '\n';
+                    ++failures;
+                }
+
+                sendPlaybackKey(window, Qt::Key_Space);
+                int pausedState = window.playerStateForTest();
+                if (!waitForState(application, window, libvlc_Paused, 2500, pausedState)) {
+                    standardError << "playback-smoke: could not establish user-paused state: "
+                                  << stateName(pausedState) << '\n';
+                    ++failures;
+                } else {
+                    expectedModal = true;
+                    const ModalObservation pausedModal = openHelpAndObservePause(window);
+                    expectedModal = false;
+                    drainEvents(application, 350);
+                    const int afterPausedModal = window.playerStateForTest();
+                    if (!pausedModal.seen ||
+                        pausedModal.title != QStringLiteral("Media Explorer Help") ||
+                        !pausedModal.paused || pausedModal.playedAfterPause ||
+                        afterPausedModal != static_cast<int>(libvlc_Paused)) {
+                        standardError << "playback-smoke: Paused -> Help state preservation failed: seen="
+                                      << pausedModal.seen << ", title=" << pausedModal.title
+                                      << ", modal-state=" << stateName(pausedModal.lastState)
+                                      << ", replayed-in-modal=" << pausedModal.playedAfterPause
+                                      << ", restored-state=" << stateName(afterPausedModal) << '\n';
+                        ++failures;
+                    }
+                }
+
+                // Return to Playing so the existing stop-path smoke assertion
+                // starts from its normal production state.
+                sendPlaybackKey(window, Qt::Key_Tab);
+                int resumedState = window.playerStateForTest();
+                if (!waitForState(application, window, libvlc_Playing, 2500, resumedState)) {
+                    standardError << "playback-smoke: could not resume after modal checks: "
+                                  << stateName(resumedState) << '\n';
+                    ++failures;
+                }
             }
 
             window.stopPlaybackForTest();

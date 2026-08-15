@@ -188,6 +188,11 @@ Playback:
 - Ctrl+Z / Ctrl+X: zoom in / out; Alt+arrows / Alt+Home: pan / recenter.
 - F1: help.
 
+While a video is playing, any dialog or popup menu temporarily pauses it. Closing
+the last popup resumes only if the video was playing beforehand; an already-paused
+video stays paused. Windowed playback shows the file name, elapsed/total time, and
+zoom percentage in the title at the top of the maximized window.
+
 Menus display the same keys but do not register competing QAction shortcuts;
 one centralized, mode-aware event dispatcher owns the complete matrix. Editable
 fields, modal dialogs, and popup menus retain their normal keys.

@@ -153,6 +153,113 @@ size_t                    g_playlistIndex = 0;
 bool                      g_userDragging = false;
 libvlc_time_t             g_lastLenForRange = -1;
 
+// Modal dialogs run nested message loops, so playback pause handling must be
+// nesting-aware.  The first hold records the user's play/pause intent and the
+// final release restores it.  A timer tick also reasserts the hold so a media
+// change initiated from inside a chooser cannot start playing behind it.
+static unsigned                 g_playbackDialogPauseDepth = 0;
+static bool                     g_resumePlaybackAfterDialogs = false;
+static bool                     g_playbackPausedByUser = false;
+static bool                     g_endReachedDuringPlaybackDialog = false;
+static libvlc_media_player_t*   g_playbackDialogPlayer = NULL;
+
+static bool AcquirePlaybackDialogPause()
+{
+    if (!g_inPlayback || g_exitingPlayback || !g_mp) return false;
+
+    if (g_playbackDialogPauseDepth == 0) {
+        g_playbackDialogPlayer = g_mp;
+        g_resumePlaybackAfterDialogs = !g_playbackPausedByUser;
+        g_endReachedDuringPlaybackDialog = false;
+        libvlc_media_player_set_pause(g_mp, 1);
+    }
+    ++g_playbackDialogPauseDepth;
+    return true;
+}
+
+static void EnforcePlaybackDialogPause()
+{
+    if ((g_playbackDialogPauseDepth > 0 || g_playbackPausedByUser) && g_inPlayback &&
+        !g_exitingPlayback && g_mp) {
+        libvlc_media_player_set_pause(g_mp, 1);
+    }
+}
+
+static void ReleasePlaybackDialogPause()
+{
+    if (g_playbackDialogPauseDepth == 0) return;
+    if (--g_playbackDialogPauseDepth != 0) {
+        EnforcePlaybackDialogPause();
+        return;
+    }
+
+    libvlc_media_player_t* heldPlayer = g_playbackDialogPlayer;
+    const bool shouldResume = g_resumePlaybackAfterDialogs;
+    const bool endReached = g_endReachedDuringPlaybackDialog;
+
+    g_playbackDialogPlayer = NULL;
+    g_resumePlaybackAfterDialogs = false;
+    g_endReachedDuringPlaybackDialog = false;
+
+    if (!g_inPlayback || g_exitingPlayback || !g_mp || g_mp != heldPlayer) return;
+
+    if (endReached && libvlc_media_player_get_state(g_mp) == libvlc_Ended) {
+        // A paused item cannot legitimately finish while the dialog is open.
+        // For an item that had been playing, let the normal UI-thread handler
+        // advance/exit only after the outermost dialog has closed.
+        if (shouldResume) {
+            PostMessageW(g_hwndMain, WM_APP + 1, 0, 0);
+        }
+        else {
+            libvlc_media_player_set_pause(g_mp, 1);
+        }
+        return;
+    }
+
+    libvlc_media_player_set_pause(g_mp, shouldResume ? 0 : 1);
+}
+
+class ScopedPlaybackDialogPause final {
+public:
+    ScopedPlaybackDialogPause() : active_(AcquirePlaybackDialogPause()) {}
+    ~ScopedPlaybackDialogPause() { if (active_) ReleasePlaybackDialogPause(); }
+
+    ScopedPlaybackDialogPause(const ScopedPlaybackDialogPause&) = delete;
+    ScopedPlaybackDialogPause& operator=(const ScopedPlaybackDialogPause&) = delete;
+
+private:
+    bool active_;
+};
+
+class ScopedWindowDisable final {
+public:
+    explicit ScopedWindowDisable(HWND hwnd)
+        : hwnd_(hwnd), restore_(hwnd && IsWindow(hwnd) && IsWindowEnabled(hwnd)) {
+        if (restore_) EnableWindow(hwnd_, FALSE);
+    }
+
+    ~ScopedWindowDisable() {
+        if (restore_ && IsWindow(hwnd_)) {
+            EnableWindow(hwnd_, TRUE);
+            SetActiveWindow(hwnd_);
+            SetForegroundWindow(hwnd_);
+        }
+    }
+
+    ScopedWindowDisable(const ScopedWindowDisable&) = delete;
+    ScopedWindowDisable& operator=(const ScopedWindowDisable&) = delete;
+
+private:
+    HWND hwnd_;
+    bool restore_;
+};
+
+static int AppMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type)
+{
+    ScopedPlaybackDialogPause playbackPause;
+    return MessageBoxW(owner, text, caption, type);
+}
+
 // ----------------------------- Configuration (mediaexplorer.ini)
 
 struct AppConfig {
@@ -2068,11 +2175,12 @@ static bool GetMediaInfoFromFfprobe(const std::wstring& path,
 // Show MessageBox with media properties for the currently playing item
 static void ShowCurrentVideoProperties() {
     if (!g_inPlayback || g_playlist.empty()) {
-        MessageBoxW(g_hwndMain, L"No video is currently playing.", L"Video properties",
+        AppMessageBoxW(g_hwndMain, L"No video is currently playing.", L"Video properties",
             MB_OK);
         return;
     }
 
+    ScopedPlaybackDialogPause playbackPause;
     const std::wstring& full = g_playlist[g_playlistIndex];
 
     // 1) Start with resolution from Shell (same as file list) so we always have
@@ -2084,12 +2192,6 @@ static void ShowCurrentVideoProperties() {
     int w = wShell;
     int h = hShell;
     std::wstring vCodec, aCodec;
-
-    // Pause playback BEFORE doing ffprobe and BEFORE showing the dialog
-    bool wasPlaying = (g_mp && libvlc_media_player_is_playing(g_mp) > 0);
-    if (g_mp && wasPlaying) {
-        libvlc_media_player_set_pause(g_mp, 1);
-    }
 
     bool okFF = false;
     if (g_cfg.ffprobeAvailable) {
@@ -2146,13 +2248,7 @@ static void ShowCurrentVideoProperties() {
     else {
         msg += L"\nMedia created: (unknown)\n";
     }
-    // Show dialog WHILE paused
-    MessageBoxW(g_hwndMain, msg.c_str(), L"Video properties", MB_OK);
-
-    // Resume playback only AFTER dialog closes
-    if (g_mp && wasPlaying) {
-        libvlc_media_player_set_pause(g_mp, 0);
-    }
+    AppMessageBoxW(g_hwndMain, msg.c_str(), L"Video properties", MB_OK);
 }
 
 static void LoadConfigFromIni() {
@@ -2283,15 +2379,7 @@ static void LoadConfigFromIni() {
 // Help
 // Help
 static void ShowHelp() {
-    // If a libVLC media player exists and is currently playing,
-    // pause it while the help window is visible.
-    bool wasPlaying = false;
-    if (g_mp) {
-        wasPlaying = (libvlc_media_player_is_playing(g_mp) > 0);
-        if (wasPlaying) {
-            libvlc_media_player_set_pause(g_mp, 1);
-        }
-    }
+    ScopedPlaybackDialogPause playbackPause;
 
     std::wstring msg;
     msg += L"Media Explorer - Help\n\n";
@@ -2338,7 +2426,8 @@ static void ShowHelp() {
         L"  Del                  : Remove current & delete on exit\n"
         L"  Ctrl+R               : Pause -> Save As (rename queued until exit)\n"
         L"  Ctrl+C               : Pause -> Save As (copy queued until exit; shown in title during copy)\n"
-        L"  Ctrl+G               : Pause -> Playlist chooser (jump with arrows)\n";
+        L"  Ctrl+G               : Pause -> Playlist chooser (jump with arrows)\n"
+        L"  Popup dialogs        : Stay paused until closed; prior play/pause state is restored\n";
 
     if (g_cfg.ffprobeAvailable) {
         msg += L"  Ctrl+P               : Show video properties (ffprobe + shell properties)\n";
@@ -2365,12 +2454,7 @@ static void ShowHelp() {
             L"  A feedback window opens for every task when playback exits.\n";
     }
 
-    MessageBoxW(g_hwndMain, msg.c_str(), L"Media Explorer - Help", MB_OK);
-
-    // Resume only if it was actually playing before F1 was pressed
-    if (g_mp && wasPlaying) {
-        libvlc_media_player_set_pause(g_mp, 0);
-    }
+    AppMessageBoxW(g_hwndMain, msg.c_str(), L"Media Explorer - Help", MB_OK);
 }
 
 // ----------------------------- ListView helpers
@@ -3450,7 +3534,7 @@ static void Browser_PasteClipboardIntoCurrent() {
 static void Browser_DeleteSelected() {
     if (g_view == ViewKind::Drives) return;
 
-    if (MessageBoxW(g_hwndMain, L"Delete selected items permanently?", L"Confirm Delete",
+    if (AppMessageBoxW(g_hwndMain, L"Delete selected items permanently?", L"Confirm Delete",
         MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
 
     std::vector<std::wstring> doomed;
@@ -3515,6 +3599,7 @@ static bool PromptCombinedOutputName(const std::wstring& baseFolder,
 {
     if (baseFolder.empty()) return false;
 
+    ScopedPlaybackDialogPause playbackPause;
     std::wstring folder = EnsureSlash(baseFolder);
 
     ComPtr<IFileSaveDialog> dlg;
@@ -4158,7 +4243,7 @@ static void ResumePendingCombineJobs() {
 // Now supports Folder view AND Search view.
 static void Browser_CombineSelected() {
     if (!g_cfg.ffmpegAvailable) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"video_combine is disabled in mediaexplorer.ini.\n"
             L"Set ffmpegAvailable = 1 to enable combining videos.",
             L"Combine videos", MB_OK);
@@ -4186,7 +4271,7 @@ static void Browser_CombineSelected() {
 
     std::wstring validationError;
     if (!ValidateCombineSourceDimensions(srcFiles, validationError)) {
-        MessageBoxW(g_hwndMain, validationError.c_str(), L"Combine videos", MB_OK | MB_ICONERROR);
+        AppMessageBoxW(g_hwndMain, validationError.c_str(), L"Combine videos", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -4243,14 +4328,14 @@ static void Browser_CombineSelected() {
     job.title = baseOutName;
     job.workingDir = copyDir;
     if (!BuildCombinePendingCommands(srcFiles, copyDir, combinedFull, job.combinedFull, job.commands)) {
-        MessageBoxW(g_hwndMain, L"Failed to build pending commands for video combine.",
+        AppMessageBoxW(g_hwndMain, L"Failed to build pending commands for video combine.",
             L"Combine videos", MB_OK);
         return;
     }
 
     std::wstring pendingJsonPath = MakePendingCombineJobPath(outStem.empty() ? baseOutName : outStem);
     if (pendingJsonPath.empty() || !SaveCombinePendingJobFile(pendingJsonPath, job)) {
-        MessageBoxW(g_hwndMain, L"Failed to create pending job file for video combine.",
+        AppMessageBoxW(g_hwndMain, L"Failed to create pending job file for video combine.",
             L"Combine videos", MB_OK);
         return;
     }
@@ -4265,7 +4350,7 @@ static void Browser_CombineSelected() {
     startMsg += L"\r\n";
 
     if (!StartCombineTaskFromPendingJob(job, pendingJsonPath, startMsg, true)) {
-        MessageBoxW(g_hwndMain, L"Failed to start background thread for video combine.",
+        AppMessageBoxW(g_hwndMain, L"Failed to start background thread for video combine.",
             L"Combine videos", MB_OK);
         return;
     }
@@ -4273,6 +4358,7 @@ static void Browser_CombineSelected() {
 
 // ----------------------------- Dialog helpers (playback)
 static bool PromptSaveAsFrom(const std::wstring& seedPath, std::wstring& outPath, const wchar_t* titleText) {
+    ScopedPlaybackDialogPause playbackPause;
     ComPtr<IFileSaveDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
         return false;
@@ -4421,8 +4507,9 @@ static LRESULT CALLBACK VideoToolsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static int PromptVideoToolsChoice(bool canUpscale, bool canFfmpeg) {
+    ScopedPlaybackDialogPause playbackPause;
     if (!canUpscale && !canFfmpeg) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"No video tools are available.\n\n"
             L"- Configure upscaleDirectory and/or\n"
             L"- Set ffmpegAvailable=1 in mediaexplorer.ini.",
@@ -4453,9 +4540,11 @@ static int PromptVideoToolsChoice(bool canUpscale, bool canFfmpeg) {
     int X = wa.left + ((wa.right - wa.left) - W) / 2;
     int Y = wa.top + ((wa.bottom - wa.top) - H) / 2;
 
+    ScopedWindowDisable disableOwner(g_hwndMain);
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"VideoToolsClass", L"Video tools",
         WS_POPUPWINDOW | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         X, Y, W, H, g_hwndMain, NULL, g_hInst, NULL);
+    if (!hwnd) return 0;
 
     SetWindowPos(hwnd, HWND_TOPMOST, X, Y, W, H, SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd);
@@ -4467,7 +4556,6 @@ static int PromptVideoToolsChoice(bool canUpscale, bool canFfmpeg) {
     }
 
     if (g_vtools.accepted) return g_vtools.choice;
-    SetForegroundWindow(g_hwndMain);
     return 0;
 }
 
@@ -4932,7 +5020,10 @@ static void CenterVideoPan() {
     ApplyVideoZoom();
 }
 
-static void PlayIndex(size_t idx) {
+static void PlayIndex(size_t idx, bool preservePauseIntent = false) {
+    if (!preservePauseIntent) g_playbackPausedByUser = false;
+    g_endReachedDuringPlaybackDialog = false;
+
     if (!g_vlc) {
         // Keep libVLC isolated from persisted VLC preferences so renderer diagnostics
         // and other OSD-style overlays cannot bleed into the embedded player.
@@ -4968,6 +5059,10 @@ static void PlayIndex(size_t idx) {
     libvlc_media_player_set_media(g_mp, m);
     libvlc_media_release(m);
     libvlc_media_player_play(g_mp);
+    if (g_playbackDialogPauseDepth > 0 ||
+        (preservePauseIntent && g_playbackPausedByUser)) {
+        libvlc_media_player_set_pause(g_mp, 1);
+    }
 }
 
 static void ToggleFullscreen() {
@@ -5324,7 +5419,7 @@ static LRESULT CALLBACK PickerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND:
         if (HIWORD(w) == LBN_SELCHANGE && (HWND)l == g_pick.hList) {
             int sel = (int)SendMessageW(g_pick.hList, LB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel < (int)g_playlist.size()) PlayIndex((size_t)sel);
+            if (sel >= 0 && sel < (int)g_playlist.size()) PlayIndex((size_t)sel, true);
             return 0;
         }
         if (HIWORD(w) == LBN_DBLCLK && (HWND)l == g_pick.hList) { DestroyWindow(h); return 0; }
@@ -5334,7 +5429,8 @@ static LRESULT CALLBACK PickerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_DESTROY:
-        if (g_mp) libvlc_media_player_set_pause(g_mp, 0);
+        g_pick.hwnd = NULL;
+        g_pick.hList = NULL;
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -5342,7 +5438,7 @@ static LRESULT CALLBACK PickerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void ShowPlaylistChooser() {
     if (!g_inPlayback || g_playlist.empty()) return;
-    if (g_mp) libvlc_media_player_set_pause(g_mp, 1);
+    ScopedPlaybackDialogPause playbackPause;
 
     static bool registered = false;
     if (!registered) {
@@ -5359,10 +5455,14 @@ static void ShowPlaylistChooser() {
     int W = DpiScale(520), H = DpiScale(420);
     int X = 0, Y = 0; CenterInWorkArea(wa, W, H, X, Y);
 
+    ScopedWindowDisable disableOwner(g_hwndMain);
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"PlaylistPickerClass", L"Playlist",
         WS_POPUPWINDOW | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         X, Y, W, H, g_hwndMain, NULL, g_hInst, NULL);
+    if (!hwnd) return;
     g_pick.hwnd = hwnd;
+    SetWindowPos(hwnd, HWND_TOPMOST, X, Y, W, H, SWP_SHOWWINDOW);
+    SetForegroundWindow(hwnd);
 
     MSG msg;
     while (IsWindow(hwnd) && GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -6150,7 +6250,7 @@ static void StartFileOpTask(FileOpTask* task) {
         if (!logWnd) {
             if (task->statusId) StatusOpEnd(task->statusId);
             delete task;
-            MessageBoxW(g_hwndMain, L"Failed to create file-op log window.", L"File operation", MB_OK);
+            AppMessageBoxW(g_hwndMain, L"Failed to create file-op log window.", L"File operation", MB_OK);
             return;
         }
         task->hwnd = logWnd;
@@ -6171,7 +6271,7 @@ static void StartFileOpTask(FileOpTask* task) {
         if (task->hwnd && IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
         delete task;
 
-        MessageBoxW(g_hwndMain, L"Failed to start background file-op thread.", L"File operation", MB_OK);
+        AppMessageBoxW(g_hwndMain, L"Failed to start background file-op thread.", L"File operation", MB_OK);
         return;
     }
 
@@ -6991,7 +7091,7 @@ static void HandleIw3SubmitFromListSelection()
     if (g_view == ViewKind::Drives) return;
 
     if (g_cfg.topazUpscaleQueue.empty()) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"TopazUpscaleQueue is not configured.\n"
             L"Set 'topazUpscaleQueue = ...' in mediaexplorer.ini.\n\n"
             L"This same queue is used for IW3 2D?3D jobs (Ctrl+3).",
@@ -7002,7 +7102,7 @@ static void HandleIw3SubmitFromListSelection()
         std::wstring msg = L"Queue path is not accessible/writable:\n\n";
         msg += g_cfg.topazUpscaleQueue;
         msg += L"\n\nFix drive mapping or update mediaexplorer.ini.";
-        MessageBoxW(g_hwndMain, msg.c_str(), L"IW3 2D?3D submit", MB_OK | MB_ICONERROR);
+        AppMessageBoxW(g_hwndMain, msg.c_str(), L"IW3 2D?3D submit", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -7016,7 +7116,7 @@ static void HandleIw3SubmitFromListSelection()
     }
 
     if (files.empty()) {
-        MessageBoxW(g_hwndMain, L"Select one or more video files first.", L"IW3 2D?3D submit", MB_OK);
+        AppMessageBoxW(g_hwndMain, L"Select one or more video files first.", L"IW3 2D?3D submit", MB_OK);
         return;
     }
 
@@ -7042,7 +7142,7 @@ static void HandleTopazSubmitFromListSelection()
 
     // Preflight
     if (g_cfg.topazUpscaleQueue.empty()) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"TopazUpscaleQueue is not configured.\n"
             L"Set 'topazUpscaleQueue = ...' in mediaexplorer.ini.",
             L"Topaz submit", MB_OK | MB_ICONERROR);
@@ -7052,7 +7152,7 @@ static void HandleTopazSubmitFromListSelection()
         std::wstring msg = L"TopazUpscaleQueue path is not accessible/writable:\n\n";
         msg += g_cfg.topazUpscaleQueue;
         msg += L"\n\nFix drive mapping or update mediaexplorer.ini.";
-        MessageBoxW(g_hwndMain, msg.c_str(), L"Topaz submit", MB_OK | MB_ICONERROR);
+        AppMessageBoxW(g_hwndMain, msg.c_str(), L"Topaz submit", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -7066,7 +7166,7 @@ static void HandleTopazSubmitFromListSelection()
     }
 
     if (files.empty()) {
-        MessageBoxW(g_hwndMain, L"Select one or more video files first.", L"Topaz submit", MB_OK);
+        AppMessageBoxW(g_hwndMain, L"Select one or more video files first.", L"Topaz submit", MB_OK);
         return;
     }
 
@@ -7195,7 +7295,7 @@ static bool IsPendingNewFolderRenameRow(int index) {
 }
 
 static void RetryPendingNewFolderRename(const std::wstring& error) {
-    MessageBoxW(g_hwndMain, error.c_str(), L"Rename Folder", MB_OK | MB_ICONERROR);
+    AppMessageBoxW(g_hwndMain, error.c_str(), L"Rename Folder", MB_OK | MB_ICONERROR);
     PostMessageW(g_hwndMain, WM_APP_BEGIN_NEW_FOLDER_RENAME, 0, 0);
 }
 
@@ -7277,7 +7377,7 @@ static void Browser_CreateNewFolder() {
 
     std::wstring target = UniqueFolderPath(g_folder, L"New Folder");
     if (target.empty()) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"Could not find an available name for a new folder.",
             L"New Folder", MB_OK | MB_ICONERROR);
         return;
@@ -7289,7 +7389,7 @@ static void Browser_CreateNewFolder() {
         message += target;
         message += L"\n\n";
         message += Win32ErrorText((DWORD)rc);
-        MessageBoxW(g_hwndMain, message.c_str(), L"New Folder", MB_OK | MB_ICONERROR);
+        AppMessageBoxW(g_hwndMain, message.c_str(), L"New Folder", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -7478,7 +7578,7 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
 static void ScheduleUpscaleForCurrentVideo() {
     if (!g_inPlayback || g_playlist.empty()) return;
     if (g_cfg.upscaleDirectory.empty()) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"Upscale directory is not configured.\n"
             L"Set 'upscaleDirectory = ...' in mediaexplorer.ini.",
             L"Submit for upscaling", MB_OK);
@@ -7502,7 +7602,7 @@ static void ScheduleUpscaleForCurrentVideo() {
     // Queue as a post-playback copy
     g_post.push_back({ ActionType::CopyToPath, cur, dst });
 
-    MessageBoxW(g_hwndMain,
+    AppMessageBoxW(g_hwndMain,
         L"Video will be copied to upscaleDirectory at the end of playback.",
         L"Submit for upscaling", MB_OK);
 }
@@ -7511,7 +7611,7 @@ static void ScheduleUpscaleForCurrentVideo() {
 
 static void ScheduleFfmpegTask(FfmpegOpKind kind) {
     if (!g_cfg.ffmpegAvailable) {
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"ffmpegAvailable is not enabled in mediaexplorer.ini.\n"
             L"Set ffmpegAvailable = 1 to use FFmpeg tools.",
             L"FFmpeg tools", MB_OK);
@@ -7537,7 +7637,7 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
     if (existingTask) {
         PostFfmpegOutput(existingTask,
             L"\r\nDuplicate request ignored; this operation is already queued.\r\n");
-        MessageBoxW(g_hwndMain,
+        AppMessageBoxW(g_hwndMain,
             L"That operation is already queued for this video.\n\n"
             L"Its feedback window will appear when playback exits.",
             L"FFmpeg task already queued", MB_OK | MB_ICONINFORMATION);
@@ -7616,7 +7716,7 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
     HWND logWnd = CreateFfmpegLogWindow(task);
     if (!logWnd) {
         delete task;
-        MessageBoxW(g_hwndMain, L"Failed to create FFmpeg task log window.",
+        AppMessageBoxW(g_hwndMain, L"Failed to create FFmpeg task log window.",
             L"FFmpeg tools", MB_OK);
         return;
     }
@@ -7654,7 +7754,7 @@ static void ScheduleFfmpegTask(FfmpegOpKind kind) {
         if (IsWindow(task->hwnd)) DestroyWindow(task->hwnd);
         delete task;
 
-        MessageBoxW(g_hwndMain, L"Failed to start background thread for FFmpeg task.",
+        AppMessageBoxW(g_hwndMain, L"Failed to start background thread for FFmpeg task.",
             L"FFmpeg tools", MB_OK);
         return;
     }
@@ -7691,8 +7791,15 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         switch (w) {
         case VK_F1:     ShowHelp(); return 0;
         case VK_RETURN: ToggleFullscreen(); return 0;
-        case VK_SPACE:  libvlc_media_player_set_pause(g_mp, 1); return 0;
-        case VK_TAB:    libvlc_media_player_set_pause(g_mp, 0); return 0;
+        case VK_SPACE:
+            g_playbackPausedByUser = true;
+            libvlc_media_player_set_pause(g_mp, 1);
+            return 0;
+        case VK_TAB:
+            g_playbackPausedByUser = false;
+            if (g_playbackDialogPauseDepth > 0) EnforcePlaybackDialogPause();
+            else libvlc_media_player_set_pause(g_mp, 0);
+            return 0;
         case VK_ESCAPE: ExitPlayback(); return 0;
 
         case 'G':
@@ -7705,9 +7812,7 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
 
         case 'V':
             if (ctrl) {
-                // Pause while we show the tools menu
-                bool wasPlaying = (libvlc_media_player_is_playing(g_mp) > 0);
-                if (wasPlaying) libvlc_media_player_set_pause(g_mp, 1);
+                ScopedPlaybackDialogPause playbackPause;
 
                 bool canUpscale = !g_cfg.upscaleDirectory.empty();
                 bool canFfmpeg = g_cfg.ffmpegAvailable;
@@ -7726,7 +7831,6 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                     ScheduleFfmpegTask(FfmpegOpKind::HFlip);
                 }
 
-                if (wasPlaying) libvlc_media_player_set_pause(g_mp, 0);
                 return 0;
             }
             break;
@@ -7750,12 +7854,10 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             if (ctrl && !g_playlist.empty()) {
                 std::wstring cur = g_playlist[g_playlistIndex];
                 std::wstring newPath;
-                libvlc_media_player_set_pause(g_mp, 1);
                 if (PromptSaveAsFrom(cur, newPath, L"Rename file")) {
                     if (_wcsicmp(cur.c_str(), newPath.c_str()) != 0)
                         g_post.push_back({ ActionType::RenameFile, cur, newPath });
                 }
-                libvlc_media_player_set_pause(g_mp, 0);
                 return 0;
             }
             break;
@@ -7764,12 +7866,10 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             if (ctrl && !g_playlist.empty()) {
                 std::wstring cur = g_playlist[g_playlistIndex];
                 std::wstring destFull;
-                libvlc_media_player_set_pause(g_mp, 1);
                 if (PromptSaveAsFrom(cur, destFull, L"Copy file to")) {
                     if (_wcsicmp(cur.c_str(), destFull.c_str()) != 0)
                         g_post.push_back({ ActionType::CopyToPath, cur, destFull });
                 }
-                libvlc_media_player_set_pause(g_mp, 0);
                 return 0;
             }
             break;
@@ -8067,6 +8167,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
 
     case WM_TIMER:
         if (w == kTimerPlaybackUI && g_inPlayback && g_mp) {
+            EnforcePlaybackDialogPause();
             libvlc_time_t len = libvlc_media_player_get_length(g_mp);
             libvlc_time_t cur = libvlc_media_player_get_time(g_mp);
             if (len != g_lastLenForRange && len > 0) {
@@ -8106,6 +8207,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_APP + 1: // VLC: end reached
+        if (!g_inPlayback || !g_mp ||
+            libvlc_media_player_get_state(g_mp) != libvlc_Ended) {
+            return 0;
+        }
+        if (g_playbackDialogPauseDepth > 0) {
+            g_endReachedDuringPlaybackDialog = true;
+            EnforcePlaybackDialogPause();
+            return 0;
+        }
         if (g_inPlayback && g_playlistIndex + 1 < g_playlist.size()) NextInPlaylist();
         else if (g_inPlayback) ExitPlayback();
         return 0;
@@ -8347,11 +8457,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
         }
         if (g_loadingFolder) {
             // Avoid tearing down the window while ShowFolder is mid-loop
-            MessageBoxW(h, L"Loading folder... please wait.", L"Media Explorer", MB_OK);
+            AppMessageBoxW(h, L"Loading folder... please wait.", L"Media Explorer", MB_OK);
             return 0;
         }
         if (HasRunningCombineTasks() || HasRunningFfmpegTasks() || HasRunningFileOpTasks()) {
-            MessageBoxW(h,
+            AppMessageBoxW(h,
                 L"Background operations are still running.\n"
                 L"Please wait for them to finish before exiting Media Explorer.",
                 L"Background tasks in progress",

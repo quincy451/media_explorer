@@ -818,6 +818,14 @@ bool MediaExplorerWindow::editableOrModalContext(QObject *watched) const {
 }
 
 bool MediaExplorerWindow::eventFilter(QObject *watched, QEvent *event) {
+    if (event->type() == QEvent::Show &&
+        (qobject_cast<QDialog *>(watched) || qobject_cast<QMenu *>(watched)) &&
+        !playbackDialogs_.contains(watched) && beginPlaybackPauseHold()) {
+        playbackDialogs_.insert(watched);
+    } else if ((event->type() == QEvent::Hide || event->type() == QEvent::Destroy) &&
+               playbackDialogs_.remove(watched) > 0) {
+        endPlaybackPauseHold();
+    }
     if (event->type() != QEvent::KeyPress || editableOrModalContext(watched)) {
         return QMainWindow::eventFilter(watched, event);
     }
@@ -2189,6 +2197,7 @@ void MediaExplorerWindow::playEntries(const QVector<Entry> &entries) {
         return;
     }
     if (!ensurePlayer()) return;
+    if (!isMaximized()) showMaximized();
     playlist_ = paths;
     playlistIndex_ = 0;
     deferredActions_.clear();
@@ -2220,16 +2229,21 @@ void MediaExplorerWindow::playIndex(int index) {
     panOffset_ = {};
     updateVideoGeometry();
     playlistWidget_->setCurrentRow(index);
-    playerTitle_->setText(QStringLiteral("(%1 of %2)  %3")
-                              .arg(index + 1).arg(playlist_.size()).arg(path));
-    setWindowTitle(QStringLiteral("%1 — Playing — %2")
-                       .arg(QString::fromLatin1(kApplicationName), QFileInfo(path).fileName()));
+    updatePlaybackTitle();
     embedVideo();
     if (libvlc_media_player_play(vlcPlayer_) == -1) {
         showError(QStringLiteral("Playback"), QStringLiteral("libVLC refused to start playback."));
         return;
     }
-    pauseButton_->setText(QStringLiteral("Pause"));
+    if (playbackPauseHolds_ > 0 || playbackPauseRestorePending_) {
+        pausePlayback(false);
+        QTimer::singleShot(0, this, [this] {
+            if (playbackPauseHolds_ > 0 || playbackPauseRestorePending_)
+                pausePlayback(false);
+        });
+    } else {
+        pauseButton_->setText(QStringLiteral("Pause"));
+    }
     lastVlcState_ = -1;
     playbackErrorShown_ = false;
 }
@@ -2240,18 +2254,79 @@ void MediaExplorerWindow::embedVideo() {
     libvlc_media_player_set_xwindow(vlcPlayer_, static_cast<uint32_t>(videoFrame_->winId()));
 }
 
-void MediaExplorerWindow::pausePlayback() {
+void MediaExplorerWindow::pausePlayback(bool userRequested) {
     if (vlcPlayer_ && stack_->currentWidget() == playerPage_) {
+        if (userRequested && (playbackPauseHolds_ > 0 || playbackPauseRestorePending_))
+            resumeAfterPlaybackPause_ = false;
         libvlc_media_player_set_pause(vlcPlayer_, 1);
         pauseButton_->setText(QStringLiteral("Resume"));
     }
 }
 
-void MediaExplorerWindow::resumePlayback() {
+void MediaExplorerWindow::resumePlayback(bool userRequested) {
     if (vlcPlayer_ && stack_->currentWidget() == playerPage_) {
+        if (userRequested && (playbackPauseHolds_ > 0 || playbackPauseRestorePending_))
+            resumeAfterPlaybackPause_ = true;
+        if (playbackPauseHolds_ > 0 || playbackPauseRestorePending_) {
+            libvlc_media_player_set_pause(vlcPlayer_, 1);
+            pauseButton_->setText(QStringLiteral("Resume"));
+            return;
+        }
         libvlc_media_player_set_pause(vlcPlayer_, 0);
         pauseButton_->setText(QStringLiteral("Pause"));
     }
+}
+
+bool MediaExplorerWindow::beginPlaybackPauseHold() {
+    if (!vlcPlayer_ || stack_->currentWidget() != playerPage_ || exitingPlayback_) return false;
+    ++playbackPauseRestoreToken_;
+    if (playbackPauseHolds_ == 0) {
+        if (!playbackPauseRestorePending_) {
+            const libvlc_state_t state = libvlc_media_player_get_state(vlcPlayer_);
+            resumeAfterPlaybackPause_ = libvlc_media_player_is_playing(vlcPlayer_) > 0 ||
+                                        state == libvlc_Playing || state == libvlc_Opening ||
+                                        state == libvlc_Buffering;
+        }
+        playbackPauseRestorePending_ = false;
+    }
+    ++playbackPauseHolds_;
+    pausePlayback(false);
+    return true;
+}
+
+void MediaExplorerWindow::endPlaybackPauseHold() {
+    if (playbackPauseHolds_ <= 0) return;
+    --playbackPauseHolds_;
+    if (playbackPauseHolds_ != 0) return;
+    playbackPauseRestorePending_ = true;
+    const quint64 token = ++playbackPauseRestoreToken_;
+    QTimer::singleShot(0, this, [this, token] {
+        if (token != playbackPauseRestoreToken_ || playbackPauseHolds_ != 0 ||
+            !playbackPauseRestorePending_) return;
+        playbackPauseRestorePending_ = false;
+        const bool shouldResume = resumeAfterPlaybackPause_;
+        resumeAfterPlaybackPause_ = false;
+        if (shouldResume && vlcPlayer_ && stack_->currentWidget() == playerPage_ && !exitingPlayback_)
+            resumePlayback(false);
+    });
+}
+
+void MediaExplorerWindow::updatePlaybackTitle() {
+    if (!vlcPlayer_ || stack_->currentWidget() != playerPage_ || playlistIndex_ < 0 ||
+        playlistIndex_ >= playlist_.size()) return;
+    const QString prefix = playlist_.size() <= 1
+        ? QStringLiteral("(Single File)")
+        : QStringLiteral("(Play List %1 of %2)").arg(playlistIndex_ + 1).arg(playlist_.size());
+    const QString fileName = QFileInfo(playlist_.at(playlistIndex_)).fileName();
+    const libvlc_time_t current = qMax<libvlc_time_t>(0, libvlc_media_player_get_time(vlcPlayer_));
+    const libvlc_time_t length = qMax<libvlc_time_t>(0, libvlc_media_player_get_length(vlcPlayer_));
+    QString title = QStringLiteral("%1 %2  %3 / %4")
+                        .arg(prefix, fileName, formatClock(current), formatClock(length));
+    if (zoom_ > 1.001)
+        title += QStringLiteral("  [Zoom %1%]").arg(qRound(zoom_ * 100.0));
+    playerTitle_->setText(title);
+    playerTitle_->setToolTip(playlist_.at(playlistIndex_));
+    setWindowTitle(title);
 }
 
 void MediaExplorerWindow::previousVideo() {
@@ -2286,6 +2361,8 @@ void MediaExplorerWindow::pollPlayer() {
     }
     timeLabel_->setText(QStringLiteral("%1 / %2").arg(formatClock(current), formatClock(length)));
     const libvlc_state_t state = libvlc_media_player_get_state(vlcPlayer_);
+    if ((playbackPauseHolds_ > 0 || playbackPauseRestorePending_) && state == libvlc_Playing)
+        pausePlayback(false);
     if (state == libvlc_Ended && lastVlcState_ != static_cast<int>(libvlc_Ended)) {
         if (playlistIndex_ + 1 < playlist_.size()) QTimer::singleShot(0, this, [this] { nextVideo(); });
         else pauseButton_->setText(QStringLiteral("Replay"));
@@ -2293,11 +2370,13 @@ void MediaExplorerWindow::pollPlayer() {
         playbackErrorShown_ = true;
         showError(QStringLiteral("Playback"), QStringLiteral("libVLC reported a playback error."));
     }
+    updatePlaybackTitle();
     lastVlcState_ = static_cast<int>(state);
 }
 
 void MediaExplorerWindow::toggleFullscreen() {
     if (stack_->currentWidget() != playerPage_) return;
+    if (!fullscreen_) wasMaximizedBeforeFullscreen_ = isMaximized();
     fullscreen_ = !fullscreen_;
     playerTitle_->setVisible(!fullscreen_);
     playlistWidget_->setVisible(!fullscreen_);
@@ -2305,13 +2384,20 @@ void MediaExplorerWindow::toggleFullscreen() {
     playerControls_->setVisible(!fullscreen_);
     menuBar()->setVisible(!fullscreen_);
     statusBar()->setVisible(!fullscreen_);
-    if (fullscreen_) showFullScreen(); else showNormal();
+    if (fullscreen_) showFullScreen();
+    else if (wasMaximizedBeforeFullscreen_) showMaximized();
+    else showNormal();
     QTimer::singleShot(0, this, [this] { updateVideoGeometry(); embedVideo(); });
 }
 
 void MediaExplorerWindow::stopPlayback() {
     if (stack_->currentWidget() != playerPage_) return;
     exitingPlayback_ = true;
+    playbackDialogs_.clear();
+    playbackPauseHolds_ = 0;
+    resumeAfterPlaybackPause_ = false;
+    playbackPauseRestorePending_ = false;
+    ++playbackPauseRestoreToken_;
     if (vlcPlayer_) libvlc_media_player_stop(vlcPlayer_);
     playerTimer_->stop();
     if (fullscreen_) {
@@ -2322,7 +2408,8 @@ void MediaExplorerWindow::stopPlayback() {
         playerControls_->show();
         menuBar()->show();
         statusBar()->show();
-        showNormal();
+        if (wasMaximizedBeforeFullscreen_) showMaximized();
+        else showNormal();
     }
     stack_->setCurrentWidget(browserPage_);
     setWindowTitle(QString::fromLatin1(kApplicationName));
@@ -2361,7 +2448,6 @@ void MediaExplorerWindow::removeCurrentDeferred() {
 
 void MediaExplorerWindow::renameCurrentDeferred() {
     if (playlistIndex_ < 0 || playlistIndex_ >= playlist_.size()) return;
-    pausePlayback();
     const QString source = playlist_.at(playlistIndex_);
     const QString destination = QFileDialog::getSaveFileName(
         this, QStringLiteral("Rename file after playback"), source,
@@ -2374,12 +2460,10 @@ void MediaExplorerWindow::renameCurrentDeferred() {
             statusBar()->showMessage(QStringLiteral("Rename queued until playback exits"), 5000);
         }
     }
-    resumePlayback();
 }
 
 void MediaExplorerWindow::copyCurrentDeferred() {
     if (playlistIndex_ < 0 || playlistIndex_ >= playlist_.size()) return;
-    pausePlayback();
     const QString source = playlist_.at(playlistIndex_);
     const QString destination = QFileDialog::getSaveFileName(
         this, QStringLiteral("Copy file after playback"), source,
@@ -2392,7 +2476,6 @@ void MediaExplorerWindow::copyCurrentDeferred() {
             statusBar()->showMessage(QStringLiteral("Copy queued until playback exits"), 5000);
         }
     }
-    resumePlayback();
 }
 
 void MediaExplorerWindow::adjustZoom(bool zoomIn) {
@@ -2400,6 +2483,7 @@ void MediaExplorerWindow::adjustZoom(bool zoomIn) {
     zoom_ = qBound(1.0, zoom_ + (zoomIn ? 0.25 : -0.25), 4.0);
     if (qFuzzyCompare(zoom_, 1.0)) panOffset_ = {};
     updateVideoGeometry();
+    updatePlaybackTitle();
 }
 
 void MediaExplorerWindow::panVideo(int dx, int dy) {
@@ -2429,7 +2513,6 @@ void MediaExplorerWindow::updateVideoGeometry() {
 
 void MediaExplorerWindow::showPlaylistChooser() {
     if (playlist_.isEmpty()) return;
-    pausePlayback();
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("Playlist"));
     dialog.resize(520, 420);
@@ -2456,7 +2539,6 @@ void MediaExplorerWindow::showPlaylistChooser() {
     layout->addWidget(buttons);
     list->setFocus();
     dialog.exec();
-    resumePlayback();
 }
 
 void MediaExplorerWindow::showVideoTools() {
@@ -2465,14 +2547,11 @@ void MediaExplorerWindow::showVideoTools() {
         showError(QStringLiteral("Video tools"), QStringLiteral("Play a video first."));
         return;
     }
-    const bool wasPlaying = vlcPlayer_ && libvlc_media_player_is_playing(vlcPlayer_) > 0;
-    if (wasPlaying) pausePlayback();
     const bool canUpscale = !config_.upscaleDirectory.isEmpty();
     const bool canFfmpeg = config_.ffmpegAvailable;
     if (!canUpscale && !canFfmpeg) {
         showError(QStringLiteral("Video tools"),
                   QStringLiteral("No video tools are configured. Enable ffmpeg or set upscale_directory."));
-        if (wasPlaying) resumePlayback();
         return;
     }
     QDialog dialog(this);
@@ -2518,7 +2597,6 @@ void MediaExplorerWindow::showVideoTools() {
     } else if (choice == 4 && canFfmpeg) {
         startFfmpegTool(FfmpegOperation::HorizontalFlip);
     }
-    if (wasPlaying) resumePlayback();
 }
 
 void MediaExplorerWindow::startFfmpegTool(FfmpegOperation operation) {
@@ -3544,6 +3622,10 @@ void MediaExplorerWindow::showHelp() {
         "<tr><td>Ctrl+Z / Ctrl+X</td><td>Zoom in / out</td></tr>"
         "<tr><td>Alt+Arrows / Alt+Home</td><td>Pan / recenter zoomed video</td></tr>"
         "</table>"
+        "<p>Opening a dialog or popup menu during playback temporarily pauses the video. "
+        "Closing the last popup restores the prior state, so a video that was already paused "
+        "stays paused. In windowed playback, the top title shows the current file, time, and "
+        "zoom percentage.</p>"
         "<p>FFmpeg encodes in a hidden per-job directory beside the source, verifies with ffprobe, "
         "and atomically publishes without replacing existing files. Playback edits publish only "
         "after playback exits. Queue JSON is published atomically after its video copy.</p>"));

@@ -201,8 +201,11 @@ private:
     void playEntries(const QVector<Entry> &entries);
     void playIndex(int index);
     void embedVideo();
-    void pausePlayback();
-    void resumePlayback();
+    void pausePlayback(bool userRequested = true);
+    void resumePlayback(bool userRequested = true);
+    bool beginPlaybackPauseHold();
+    void endPlaybackPauseHold();
+    void updatePlaybackTitle();
     void previousVideo();
     void nextVideo();
     void seekBy(qint64 milliseconds);
@@ -317,7 +320,13 @@ private:
     bool playbackErrorShown_ = false;
     int lastVlcState_ = -1;
     bool fullscreen_ = false;
+    bool wasMaximizedBeforeFullscreen_ = false;
     bool exitingPlayback_ = false;
+    QSet<QObject *> playbackDialogs_;
+    int playbackPauseHolds_ = 0;
+    bool resumeAfterPlaybackPause_ = false;
+    bool playbackPauseRestorePending_ = false;
+    quint64 playbackPauseRestoreToken_ = 0;
     double zoom_ = 1.0;
     QPoint panOffset_;
 };

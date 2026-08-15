@@ -303,7 +303,7 @@ QString formatDuration(double seconds) {
 }
 
 QString formatClock(qint64 milliseconds) {
-    return formatDuration(qMax<qint64>(0, milliseconds) / 1000.0);
+    return formatDuration(qMax<qint64>(0, milliseconds) / 1000);
 }
 
 QString fileKind(const QString &path) {
