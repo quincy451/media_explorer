@@ -147,6 +147,13 @@ int runSelfTest(QApplication &application, const AppConfig &config, bool shortcu
         reporter.check(QStringLiteral("video-extension-recognition"),
                        isVideoFile(QStringLiteral("sample.MP4"), config.videoExtensions) &&
                            !isVideoFile(QStringLiteral("sample.txt"), config.videoExtensions));
+        const QVector<MountRecord> mountRecords = readMountRecords();
+        bool rootMountFound = false;
+        for (const MountRecord &record : mountRecords) {
+            rootMountFound = rootMountFound || record.path == QStringLiteral("/");
+        }
+        reporter.check(QStringLiteral("mountinfo-read"), !mountRecords.isEmpty() && rootMountFound,
+                       QStringLiteral("%1 mount records").arg(mountRecords.size()));
         const QVector<Entry> mounts = discoverMounts(config);
         bool mountsValid = !mounts.isEmpty();
         for (const Entry &entry : mounts) mountsValid = mountsValid && entry.directory && !entry.path.isEmpty();

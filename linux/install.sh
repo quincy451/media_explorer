@@ -186,8 +186,11 @@ install_system_desktop_wrapper() {
 
     install -d -m 755 -o "$owner" -g "$owner" "$desktop_dir"
     install -d -m 700 -o "$owner" -g "$owner" "$backup_dir"
+    if [[ -e "${shortcut}.backup" || -L "${shortcut}.backup" ]]; then
+        legacy_backups+=("${shortcut}.backup")
+    fi
     shopt -s nullglob
-    legacy_backups=("${shortcut}.backup" "${shortcut}.backup."[0-9]*)
+    legacy_backups+=("${shortcut}.backup."[0-9]*)
     shopt -u nullglob
     for legacy_backup in "${legacy_backups[@]}"; do
         if [[ -d "$legacy_backup" && ! -L "$legacy_backup" ]]; then

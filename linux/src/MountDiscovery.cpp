@@ -85,8 +85,12 @@ QVector<MountRecord> readMountRecords() {
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return records;
     }
-    while (!file.atEnd()) {
-        const QString line = QString::fromUtf8(file.readLine()).trimmed();
+    for (;;) {
+        const QByteArray rawLine = file.readLine();
+        if (rawLine.isEmpty()) {
+            break;
+        }
+        const QString line = QString::fromUtf8(rawLine).trimmed();
         const QStringList fields = line.split(QLatin1Char(' '), Qt::SkipEmptyParts);
         const int separator = fields.indexOf(QStringLiteral("-"));
         if (separator < 0 || fields.size() < 7 || separator + 2 >= fields.size()) {
