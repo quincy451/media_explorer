@@ -112,10 +112,13 @@ Desktop triggers the misleading “executable script” warning, and neither a P
 symlink nor GIO `metadata::trusted` reliably suppresses it. The system installer
 therefore creates a regular mode-0644 `Type=Link` wrapper on the user's Desktop,
 pointing to the trusted registered entry at
-`file:///usr/share/applications/media-explorer.desktop`. An existing launcher is
-preserved as `.backup` (or `.backup.N`). `--user` installs the application entry
-under `~/.local` but skips this wrapper because libfm does not treat that target as
-trusted. Use `--no-desktop-shortcut` to skip it for a system install.
+`/usr/share/applications/media-explorer.desktop`. The bare native path is
+intentional: libfm's trusted-target check does not accept a `file://` URI here.
+An existing launcher is preserved outside the Desktop under
+`~/.local/state/media-explorer/launcher-backups`. `--user` installs the
+application entry under `~/.local` but skips this wrapper because libfm does not
+treat that target as trusted. Use `--no-desktop-shortcut` to skip it for a system
+install.
 
 The launcher and executable force `QT_QPA_PLATFORM=xcb`; libVLC 3 embeds into an
 X11 XID. On a Wayland labwc session this runs through XWayland, and it also works

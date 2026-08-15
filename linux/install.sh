@@ -180,9 +180,31 @@ install_system_desktop_wrapper() {
     local owner="$2"
     local shortcut="${desktop_dir}/Media Explorer.desktop"
     local template="${SCRIPT_DIR}/MediaExplorer.desktop-link.in"
-    local backup counter temporary
+    local backup_dir="${TARGET_HOME}/.local/state/media-explorer/launcher-backups"
+    local backup counter legacy_backup legacy_name temporary
+    local -a legacy_backups=()
 
     install -d -m 755 -o "$owner" -g "$owner" "$desktop_dir"
+    install -d -m 700 -o "$owner" -g "$owner" "$backup_dir"
+    shopt -s nullglob
+    legacy_backups=("${shortcut}.backup" "${shortcut}.backup."[0-9]*)
+    shopt -u nullglob
+    for legacy_backup in "${legacy_backups[@]}"; do
+        if [[ -d "$legacy_backup" && ! -L "$legacy_backup" ]]; then
+            echo "Leaving unexpected backup directory on Desktop: $legacy_backup" >&2
+            continue
+        fi
+        legacy_name="$(basename -- "$legacy_backup")"
+        backup="${backup_dir}/${legacy_name}"
+        counter=2
+        while [[ -e "$backup" || -L "$backup" ]]; do
+            backup="${backup_dir}/${legacy_name}.${counter}"
+            ((counter += 1))
+        done
+        mv -- "$legacy_backup" "$backup"
+        chown -h "$owner:$owner" "$backup"
+        echo "Moved legacy Desktop backup to: $backup"
+    done
     if [[ -f "$shortcut" && ! -L "$shortcut" ]] && cmp -s -- "$template" "$shortcut"; then
         chmod 644 "$shortcut"
         chown "$owner:$owner" "$shortcut"
@@ -193,10 +215,10 @@ install_system_desktop_wrapper() {
         return 1
     fi
     if [[ -e "$shortcut" || -L "$shortcut" ]]; then
-        backup="${shortcut}.backup"
+        backup="${backup_dir}/Media Explorer.desktop.backup"
         counter=2
         while [[ -e "$backup" || -L "$backup" ]]; do
-            backup="${shortcut}.backup.${counter}"
+            backup="${backup_dir}/Media Explorer.desktop.backup.${counter}"
             ((counter += 1))
         done
         mv -- "$shortcut" "$backup"

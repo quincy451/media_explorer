@@ -3,4 +3,4 @@ Type=Link
 Version=1.0
 Name=Media Explorer
 Icon=/usr/share/icons/hicolor/scalable/apps/media-explorer.svg
-URL=file:///usr/share/applications/media-explorer.desktop
+URL=/usr/share/applications/media-explorer.desktop
