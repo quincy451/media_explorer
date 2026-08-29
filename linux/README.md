@@ -77,6 +77,9 @@ path. It needs a short video and an X11/XWayland display:
 
 ```bash
 DISPLAY=:0 make playback-smoke PLAYBACK_CLIP=/path/to/short-video.mp4
+# Also seek to the end and verify loop-on repeat plus loop-off completion:
+DISPLAY=:0 make playback-smoke PLAYBACK_CLIP=/path/to/short-video.mp4 \
+  PLAYBACK_SMOKE_ARGS="--verify-loop"
 # Soak example:
 DISPLAY=:0 make playback-smoke PLAYBACK_CLIP=/path/to/short-video.mp4 \
   PLAYBACK_SMOKE_ARGS="--cycles 50"
@@ -183,6 +186,7 @@ Playback:
 - Ctrl+Left / Ctrl+Right: previous / next video.
 - Up / Down: volume by 5, from 0 through 200.
 - Ctrl+G: live playlist chooser; Ctrl+P: video properties.
+- Ctrl+L: toggle looping of the current video for this playback session.
 - Ctrl+V: tools (`1` upscale, `2` trim front, `3` trim end, `4` horizontal flip).
 - Ctrl+R / Ctrl+C / Delete: queue rename / copy / prompted deletion after playback.
 - Ctrl+Z / Ctrl+X: zoom in / out; Alt+arrows / Alt+Home: pan / recenter.
@@ -191,7 +195,9 @@ Playback:
 While a video is playing, any dialog or popup menu temporarily pauses it. Closing
 the last popup resumes only if the video was playing beforehand; an already-paused
 video stays paused. Windowed playback shows the file name, elapsed/total time, and
-zoom percentage in the title at the top of the maximized window.
+zoom percentage in the title at the top of the maximized window. While looping is
+enabled, `  [Looping]` appears at the right end of that line in windowed mode and
+the current video restarts when it ends. Looping resets when playback exits.
 
 Menus display the same keys but do not register competing QAction shortcuts;
 one centralized, mode-aware event dispatcher owns the complete matrix. Editable

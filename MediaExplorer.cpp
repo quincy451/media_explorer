@@ -148,6 +148,7 @@ libvlc_instance_t* g_vlc = NULL;
 libvlc_media_player_t* g_mp = NULL;
 bool                      g_inPlayback = false;
 bool                      g_exitingPlayback = false;
+bool                      g_loopCurrentVideo = false;
 std::vector<std::wstring> g_playlist;
 size_t                    g_playlistIndex = 0;
 bool                      g_userDragging = false;
@@ -2021,6 +2022,9 @@ static void SetTitlePlaying() {
         swprintf_s(zoomBuf, L"  [Zoom %d%%]", zoomPct);
         t += zoomBuf;
     }
+    if (g_loopCurrentVideo && !g_fullscreen) {
+        t += L"  [Looping]";
+    }
     SetWindowTextW(g_hwndMain, t.c_str());
 }
 
@@ -2420,6 +2424,7 @@ static void ShowHelp() {
         L"  Space / Tab          : Pause / Resume\n"
         L"  Left / Right         : Seek -/+10s (hold Shift: -/+60s)\n"
         L"  Ctrl+Left / Ctrl+Right : Previous / Next in playlist\n"
+        L"  Ctrl+L               : Toggle looping of the current video\n"
         L"  Up / Down            : Volume +/-5 (0..200)\n"
         L"  Ctrl+Z / Ctrl+X      : Zoom in / Zoom out back to fit\n"
         L"  Alt+Arrows / Alt+Home : Pan view / recenter\n"
@@ -5020,7 +5025,8 @@ static void CenterVideoPan() {
     ApplyVideoZoom();
 }
 
-static void PlayIndex(size_t idx, bool preservePauseIntent = false) {
+static void PlayIndex(size_t idx, bool preservePauseIntent = false,
+    bool preserveVideoView = false) {
     if (!preservePauseIntent) g_playbackPausedByUser = false;
     g_endReachedDuringPlaybackDialog = false;
 
@@ -5047,7 +5053,12 @@ static void PlayIndex(size_t idx, bool preservePauseIntent = false) {
             [](const libvlc_event_t*, void*) { PostMessageW(g_hwndMain, WM_APP + 1, 0, 0); }, NULL);
     }
 
-    ResetVideoZoom();
+    if (preserveVideoView) {
+        StopVideoPanDrag();
+    }
+    else {
+        ResetVideoZoom();
+    }
     g_videoLayoutWarmupTicks = kVideoLayoutWarmupTicks;
     g_playlistIndex = idx;
     g_lastLenForRange = -1;
@@ -5094,6 +5105,7 @@ static void ToggleFullscreen() {
         g_fullscreen = false;
     }
     SendMessageW(h, WM_SIZE, 0, 0);
+    SetTitlePlaying();
     if (g_hwndVideo) SetFocus(g_hwndVideo);
 }
 
@@ -5325,6 +5337,7 @@ static void ExitPlayback() {
     WaitForFfmpegTasksAndFinalize();
 
     g_inPlayback = false;
+    g_loopCurrentVideo = false;
     UpdateMainLayout();
     SetFocus(g_hwndList);
 
@@ -5359,6 +5372,7 @@ static void PlaySelectedVideos() {
 
     ForceMaximizeForPlayback();
 
+    g_loopCurrentVideo = false;
     g_inPlayback = true;
     UpdateMainLayout();
     SetFocus(g_hwndVideo);
@@ -7806,6 +7820,14 @@ static LRESULT CALLBACK VideoSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             if (ctrl) { ShowPlaylistChooser(); return 0; }
             break;
 
+        case 'L':
+            if (ctrl) {
+                g_loopCurrentVideo = !g_loopCurrentVideo;
+                SetTitlePlaying();
+                return 0;
+            }
+            break;
+
         case 'P':
             if (ctrl) { ShowCurrentVideoProperties(); return 0; }
             break;
@@ -7936,6 +7958,7 @@ static LRESULT CALLBACK SeekSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         if (ctrl && (w == 'R' || w == 'r')) { SendMessageW(g_hwndVideo, WM_KEYDOWN, 'R', 0); return 0; }
         if (ctrl && (w == 'C' || w == 'c')) { SendMessageW(g_hwndVideo, WM_KEYDOWN, 'C', 0); return 0; }
         if (ctrl && (w == 'G' || w == 'g')) { ShowPlaylistChooser(); return 0; }
+        if (ctrl && (w == 'L' || w == 'l')) { SendMessageW(g_hwndVideo, WM_KEYDOWN, 'L', 0); return 0; }
         if (ctrl && (w == 'P' || w == 'p')) { SendMessageW(g_hwndVideo, WM_KEYDOWN, 'P', 0); return 0; }
         if (ctrl && (w == 'V' || w == 'v')) { SendMessageW(g_hwndVideo, WM_KEYDOWN, 'V', 0); return 0; }
         if (ctrl && (w == 'Z' || w == 'z')) { AdjustVideoZoom(true); if (g_hwndVideo) SetFocus(g_hwndVideo); return 0; }
@@ -8216,7 +8239,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM wParam, LPARAM lParam)
             EnforcePlaybackDialogPause();
             return 0;
         }
-        if (g_inPlayback && g_playlistIndex + 1 < g_playlist.size()) NextInPlaylist();
+        if (g_inPlayback && g_loopCurrentVideo) PlayIndex(g_playlistIndex, false, true);
+        else if (g_inPlayback && g_playlistIndex + 1 < g_playlist.size()) NextInPlaylist();
         else if (g_inPlayback) ExitPlayback();
         return 0;
 

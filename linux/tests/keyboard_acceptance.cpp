@@ -166,6 +166,7 @@ void checkPlaybackClassifier(TestContext &test) {
         {Qt::Key_V, control, Command::VideoTools, "playback Ctrl+V"},
         {Qt::Key_R, control, Command::RenameDeferred, "playback Ctrl+R"},
         {Qt::Key_C, control, Command::CopyDeferred, "playback Ctrl+C"},
+        {Qt::Key_L, control, Command::ToggleLooping, "playback Ctrl+L"},
         {Qt::Key_Z, control, Command::ZoomIn, "playback Ctrl+Z"},
         {Qt::Key_X, control, Command::ZoomOut, "playback Ctrl+X"},
         {Qt::Key_Left, control, Command::Previous, "playback Ctrl+Left"},
@@ -209,6 +210,15 @@ void checkPlaybackClassifier(TestContext &test) {
         const Command actual = MediaExplorerWindow::playbackCommandFor(route.key, route.modifiers);
         test.expect(actual == route.expected, QString::fromLatin1(route.description));
     }
+
+    test.expect(MediaExplorerWindow::playbackIndexAfterEnd(1, 3, true) == 1,
+                QStringLiteral("looping replays the current playlist item"));
+    test.expect(MediaExplorerWindow::playbackIndexAfterEnd(1, 3, false) == 2,
+                QStringLiteral("non-looping playback advances to the next playlist item"));
+    test.expect(MediaExplorerWindow::playbackIndexAfterEnd(2, 3, false) == -1,
+                QStringLiteral("non-looping playback stops after the final playlist item"));
+    test.expect(MediaExplorerWindow::playbackIndexAfterEnd(-1, 3, true) == -1,
+                QStringLiteral("invalid playback indexes are never replayed"));
 }
 
 void checkAdvertisedMatrix(TestContext &test) {
@@ -228,7 +238,8 @@ void checkAdvertisedMatrix(TestContext &test) {
         QStringLiteral("Escape=exit"), QStringLiteral("Ctrl+G=playlist"),
         QStringLiteral("Ctrl+P=properties"), QStringLiteral("Ctrl+V=tools"),
         QStringLiteral("Ctrl+R=rename-on-exit"), QStringLiteral("Ctrl+C=copy-on-exit"),
-        QStringLiteral("Ctrl+Z|Ctrl+X=zoom"), QStringLiteral("Delete=delete-on-exit"),
+        QStringLiteral("Ctrl+L=loop-current"), QStringLiteral("Ctrl+Z|Ctrl+X=zoom"),
+        QStringLiteral("Delete=delete-on-exit"),
         QStringLiteral("Alt+Arrows|Alt+Home=pan"), QStringLiteral("Up|Down=volume"),
         QStringLiteral("Left|Right=seek"), QStringLiteral("Shift+Left|Shift+Right=seek-60"),
         QStringLiteral("Ctrl+Left|Ctrl+Right=previous/next")};
@@ -267,6 +278,12 @@ void checkEventDelivery(QApplication &application, TestContext &test,
     test.expect(sendKey(application, probe, window.table_, Qt::Key_Up,
                         Qt::ControlModifier) == 0,
                 QStringLiteral("browser Ctrl+Up is consumed exactly once"));
+    window.location_->setReadOnly(true);
+    test.expect(sendKey(application, probe, window.table_, Qt::Key_L,
+                        Qt::ControlModifier) == 0,
+                QStringLiteral("browser Ctrl+L is consumed"));
+    test.expect(!window.location_->isReadOnly() && window.location_->hasFocus(),
+                QStringLiteral("browser Ctrl+L still edits the location"));
 
     // Browser Escape must target only the active file mutation.  It must not
     // cancel search/scan/media work or leave Search view.
@@ -359,6 +376,13 @@ void checkEventDelivery(QApplication &application, TestContext &test,
                 QStringLiteral("Space is consumed from videoFrame"));
     test.expect(sendKey(application, probe, window.videoFrame_, Qt::Key_Tab) == 0,
                 QStringLiteral("Tab is consumed from videoFrame"));
+    test.expect(!window.looping_, QStringLiteral("playback looping starts off"));
+    test.expect(sendKey(application, probe, window.videoFrame_, Qt::Key_L,
+                        Qt::ControlModifier) == 0,
+                QStringLiteral("playback Ctrl+L is consumed from videoFrame"));
+    test.expect(window.looping_, QStringLiteral("playback Ctrl+L enables looping"));
+    sendKey(application, probe, window.videoFrame_, Qt::Key_L, Qt::ControlModifier);
+    test.expect(!window.looping_, QStringLiteral("second playback Ctrl+L disables looping"));
 
     window.zoom_ = 2.0;
     window.panOffset_ = {};
@@ -386,6 +410,12 @@ void checkEventDelivery(QApplication &application, TestContext &test,
     test.expect(window.seekSlider_->hasFocus(), QStringLiteral("seekSlider really held focus"));
     test.expect(window.volumeSlider_->value() == 105,
                 QStringLiteral("seekSlider Up executes volume exactly once"));
+    test.expect(sendKey(application, probe, window.seekSlider_, Qt::Key_L,
+                        Qt::ControlModifier) == 0,
+                QStringLiteral("playback Ctrl+L is consumed from seekSlider"));
+    test.expect(window.looping_, QStringLiteral("seekSlider Ctrl+L enables looping"));
+    sendKey(application, probe, window.seekSlider_, Qt::Key_L, Qt::ControlModifier);
+    test.expect(!window.looping_, QStringLiteral("second seekSlider Ctrl+L disables looping"));
     window.seekSlider_->setValue(500);
     test.expect(sendKey(application, probe, window.seekSlider_, Qt::Key_Left) == 0,
                 QStringLiteral("Left seek is consumed from seekSlider"));
@@ -428,7 +458,10 @@ void checkEventDelivery(QApplication &application, TestContext &test,
     window.playlist_.clear();
     window.playlistIndex_ = -1;
 
-    window.stack_->setCurrentWidget(window.browserPage_);
+    window.viewMode_ = MediaExplorerWindow::ViewMode::Roots;
+    window.looping_ = true;
+    window.stopPlayback();
+    test.expect(!window.looping_, QStringLiteral("looping resets when playback exits"));
     window.exitingPlayback_ = false;
     window.close();
     application.processEvents();

@@ -8,6 +8,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QMessageBox>
 #include <QSize>
 #include <QTemporaryDir>
@@ -23,6 +24,7 @@ struct Options {
     QString clipPath;
     int cycles = 1;
     int timeoutMs = 15000;
+    bool verifyLoop = false;
     bool help = false;
     QString error;
 };
@@ -59,6 +61,8 @@ Options parseOptions(int argc, char **argv) {
         const QString argument = QString::fromLocal8Bit(argv[index]);
         if (argument == QStringLiteral("--help") || argument == QStringLiteral("-h")) {
             options.help = true;
+        } else if (argument == QStringLiteral("--verify-loop")) {
+            options.verifyLoop = true;
         } else if (argument == QStringLiteral("--cycles")) {
             if (++index >= argc ||
                 !parsePositiveInteger(QString::fromLocal8Bit(argv[index]), 1000, options.cycles)) {
@@ -101,11 +105,13 @@ Options parseOptions(int argc, char **argv) {
 }
 
 void printUsage(QTextStream &stream) {
-    stream << "Usage: playback-smoke [--cycles N] [--timeout-ms N] VIDEO\n"
+    stream << "Usage: playback-smoke [--cycles N] [--timeout-ms N] [--verify-loop] VIDEO\n"
               "\n"
               "Runs real embedded libVLC playback through MediaExplorerWindow.\n"
               "VIDEO may instead be supplied with MEDIA_EXPLORER_TEST_CLIP.\n"
-              "The cycle count defaults to 1; use --cycles 50 for a soak run.\n";
+              "The cycle count defaults to 1; use --cycles 50 for a soak run.\n"
+              "--verify-loop seeks near the end and verifies repeat and loop-off behavior;\n"
+              "use it with a short seekable test clip.\n";
 }
 
 QString stateName(int state) {
@@ -183,6 +189,53 @@ bool waitForState(QApplication &application, MediaExplorerWindow &window,
         if (lastState == static_cast<int>(libvlc_Error) ||
             lastState == static_cast<int>(libvlc_Stopped) ||
             lastState == static_cast<int>(libvlc_Ended)) return false;
+        QThread::msleep(10);
+    } while (elapsed.elapsed() < timeoutMs);
+    return false;
+}
+
+bool waitForGenerationAdvance(QApplication &application, MediaExplorerWindow &window,
+                              quint64 generation, int timeoutMs, int &lastState,
+                              qint64 &lastTime) {
+    QElapsedTimer elapsed;
+    elapsed.start();
+    do {
+        application.processEvents(QEventLoop::AllEvents, 25);
+        lastState = window.playerStateForTest();
+        lastTime = window.playerTimeForTest();
+        if (window.playbackGenerationForTest() > generation &&
+            lastState == static_cast<int>(libvlc_Playing))
+            return true;
+        if (lastState == static_cast<int>(libvlc_Error)) return false;
+        QThread::msleep(10);
+    } while (elapsed.elapsed() < timeoutMs);
+    return false;
+}
+
+bool waitForEndedWithoutGenerationAdvance(QApplication &application,
+                                          MediaExplorerWindow &window,
+                                          quint64 generation, int timeoutMs,
+                                          int &lastState) {
+    QElapsedTimer elapsed;
+    QElapsedTimer endedStable;
+    bool endedSeen = false;
+    elapsed.start();
+    do {
+        application.processEvents(QEventLoop::AllEvents, 25);
+        lastState = window.playerStateForTest();
+        if (window.playbackGenerationForTest() != generation) return false;
+        if (lastState == static_cast<int>(libvlc_Ended)) {
+            if (!endedSeen) {
+                endedSeen = true;
+                endedStable.start();
+            }
+            if (endedStable.elapsed() >= 400) return true;
+        } else if (endedSeen) {
+            return false;
+        }
+        if (lastState == static_cast<int>(libvlc_Error) ||
+            lastState == static_cast<int>(libvlc_Stopped))
+            return false;
         QThread::msleep(10);
     } while (elapsed.elapsed() < timeoutMs);
     return false;
@@ -352,12 +405,144 @@ int main(int argc, char **argv) {
                 const QString initialTitle = window.windowTitle();
                 if (!initialTitle.startsWith(QStringLiteral("(Single File)")) ||
                     !initialTitle.contains(QFileInfo(clipPath).fileName()) ||
-                    !initialTitle.contains(QStringLiteral(" / "))) {
+                    !initialTitle.contains(QStringLiteral(" / ")) ||
+                    initialTitle.contains(QStringLiteral("[Looping]"))) {
                     standardError << "playback-smoke: playback title is incomplete: "
                                   << initialTitle << '\n';
                     ++failures;
                 }
 
+                sendPlaybackKey(window, Qt::Key_L, Qt::ControlModifier);
+                sendPlaybackKey(window, Qt::Key_Z, Qt::ControlModifier);
+                application.processEvents();
+                QLabel *titleLine = window.findChild<QLabel *>(QStringLiteral("playerTitle"));
+                const QString loopingTitle = window.windowTitle();
+                if (!loopingTitle.contains(QStringLiteral("[Zoom 125%]")) ||
+                    !loopingTitle.endsWith(QStringLiteral("  [Looping]")) || !titleLine ||
+                    !titleLine->text().endsWith(QStringLiteral("  [Looping]"))) {
+                    standardError << "playback-smoke: looping marker is not at title end: "
+                                  << loopingTitle << '\n';
+                    ++failures;
+                }
+                sendPlaybackKey(window, Qt::Key_Return);
+                application.processEvents();
+                if (window.windowTitle().contains(QStringLiteral("[Looping]")) ||
+                    (titleLine && (titleLine->isVisible() ||
+                                   titleLine->text().contains(QStringLiteral("[Looping]"))))) {
+                    standardError << "playback-smoke: fullscreen title retained looping marker: "
+                                  << window.windowTitle() << '\n';
+                    ++failures;
+                }
+                sendPlaybackKey(window, Qt::Key_Return);
+                application.processEvents();
+                if (!window.windowTitle().endsWith(QStringLiteral("  [Looping]")) ||
+                    !titleLine || !titleLine->isVisible() ||
+                    !titleLine->text().endsWith(QStringLiteral("  [Looping]"))) {
+                    standardError << "playback-smoke: windowed title did not restore looping marker: "
+                                  << window.windowTitle() << '\n';
+                    ++failures;
+                }
+
+                if (options.verifyLoop) {
+                    const qint64 loopLength = window.playerLengthForTest();
+                    const quint64 loopGeneration = window.playbackGenerationForTest();
+                    const qint64 loopLead =
+                        qMin<qint64>(250, qMax<qint64>(1, loopLength / 4));
+                    int loopState = window.playerStateForTest();
+                    qint64 loopTime = window.playerTimeForTest();
+                    if (loopLength <= 0 ||
+                        !window.setPlayerTimeForTest(qMax<qint64>(0, loopLength - loopLead)) ||
+                        !waitForGenerationAdvance(application, window, loopGeneration,
+                                                  options.timeoutMs, loopState, loopTime)) {
+                        standardError
+                            << "playback-smoke: loop did not restart current media: length="
+                            << loopLength << ", generation="
+                            << window.playbackGenerationForTest() << ", state="
+                            << stateName(loopState) << ", time=" << loopTime << '\n';
+                        ++failures;
+                    } else if (loopTime >= qMax<qint64>(1, loopLength - loopLead) ||
+                               !window.windowTitle().contains(QStringLiteral("[Zoom 125%]")) ||
+                               !window.windowTitle().endsWith(QStringLiteral("  [Looping]"))) {
+                        standardError
+                            << "playback-smoke: loop restart did not wrap time or preserve "
+                               "view/title: time="
+                            << loopTime << ", title=" << window.windowTitle() << '\n';
+                        ++failures;
+                    }
+                }
+
+                sendPlaybackKey(window, Qt::Key_L, Qt::ControlModifier);
+                application.processEvents();
+                if (window.windowTitle().contains(QStringLiteral("[Looping]"))) {
+                    standardError << "playback-smoke: disabled loop retained title marker: "
+                                  << window.windowTitle() << '\n';
+                    ++failures;
+                }
+
+                if (options.verifyLoop) {
+                    const qint64 normalLength = window.playerLengthForTest();
+                    const quint64 normalGeneration = window.playbackGenerationForTest();
+                    const qint64 normalLead =
+                        qMin<qint64>(250, qMax<qint64>(1, normalLength / 4));
+                    int endedState = window.playerStateForTest();
+                    if (normalLength <= 0 ||
+                        !window.setPlayerTimeForTest(
+                            qMax<qint64>(0, normalLength - normalLead)) ||
+                        !waitForEndedWithoutGenerationAdvance(
+                            application, window, normalGeneration, options.timeoutMs,
+                            endedState)) {
+                        standardError
+                            << "playback-smoke: loop-off did not retain normal end behavior: "
+                            << "length=" << normalLength << ", generation="
+                            << window.playbackGenerationForTest() << ", state="
+                            << stateName(endedState) << '\n';
+                        ++failures;
+                    }
+
+                    // Turn the setting back on while Ended, then begin a new
+                    // two-item session. The new session must reset it; after
+                    // re-enabling it, a manual Next must retain it.
+                    sendPlaybackKey(window, Qt::Key_L, Qt::ControlModifier);
+                    if (!window.startPlaybackForTest(QStringList{clipPath, clipPath})) {
+                        standardError << "playback-smoke: could not restart after loop checks\n";
+                        ++failures;
+                    } else {
+                        const PlaybackResult restarted =
+                            waitForPlayback(application, window, options.timeoutMs);
+                        if (!restarted.playing ||
+                            window.windowTitle().contains(QStringLiteral("[Looping]"))) {
+                            standardError
+                                << "playback-smoke: new playback session did not reset loop: "
+                                << window.windowTitle() << '\n';
+                            ++failures;
+                        }
+
+                        sendPlaybackKey(window, Qt::Key_L, Qt::ControlModifier);
+                        const quint64 beforeManualNext =
+                            window.playbackGenerationForTest();
+                        sendPlaybackKey(window, Qt::Key_Right, Qt::ControlModifier);
+                        int nextState = window.playerStateForTest();
+                        qint64 nextTime = window.playerTimeForTest();
+                        if (!waitForGenerationAdvance(application, window, beforeManualNext,
+                                                      options.timeoutMs, nextState, nextTime) ||
+                            !window.windowTitle().startsWith(
+                                QStringLiteral("(Play List 2 of 2)")) ||
+                            !window.windowTitle().endsWith(QStringLiteral("  [Looping]"))) {
+                            standardError
+                                << "playback-smoke: manual Next did not retain looping: "
+                                << window.windowTitle() << ", state="
+                                << stateName(nextState) << '\n';
+                            ++failures;
+                        }
+                        sendPlaybackKey(window, Qt::Key_L, Qt::ControlModifier);
+                    }
+                }
+
+                // The marker/loop checks intentionally zoomed in so a repeat
+                // could prove that view state survives. Restore fit before the
+                // pre-existing zoom acceptance checks below.
+                sendPlaybackKey(window, Qt::Key_X, Qt::ControlModifier);
+                application.processEvents();
                 sendPlaybackKey(window, Qt::Key_Z, Qt::ControlModifier);
                 application.processEvents();
                 const QString zoomedTitle = window.windowTitle();

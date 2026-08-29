@@ -64,7 +64,7 @@ public:
         ReorderDown, Combine, EditLocation, ShowRoots, ToggleFullscreen, Pause,
         Resume, ExitPlayback, PanLeft, PanRight, PanUp, PanDown, CenterPan,
         Playlist, VideoProperties, VideoTools, RenameDeferred, CopyDeferred,
-        ZoomIn, ZoomOut, Previous, Next, RemoveDeferred, VolumeUp, VolumeDown,
+        ZoomIn, ZoomOut, ToggleLooping, Previous, Next, RemoveDeferred, VolumeUp, VolumeDown,
         SeekBack10, SeekForward10, SeekBack60, SeekForward60
     };
 
@@ -80,6 +80,10 @@ public:
     // playlist/libVLC wiring without exposing libVLC handles.
     bool startPlaybackForTest(const QStringList &paths);
     int playerStateForTest() const;
+    qint64 playerTimeForTest() const;
+    qint64 playerLengthForTest() const;
+    quint64 playbackGenerationForTest() const;
+    bool setPlayerTimeForTest(qint64 milliseconds);
     QSize videoSizeForTest() const;
     void stopPlaybackForTest();
 
@@ -199,13 +203,16 @@ private:
     bool ensurePlayer();
     void playSelected();
     void playEntries(const QVector<Entry> &entries);
-    void playIndex(int index);
+    void playIndex(int index, bool resetView = true);
     void embedVideo();
     void pausePlayback(bool userRequested = true);
     void resumePlayback(bool userRequested = true);
     bool beginPlaybackPauseHold();
     void endPlaybackPauseHold();
     void updatePlaybackTitle();
+    void toggleLooping();
+    static int playbackIndexAfterEnd(int currentIndex, int playlistSize, bool looping);
+    void processPendingPlaybackEnd();
     void previousVideo();
     void nextVideo();
     void seekBy(qint64 milliseconds);
@@ -327,6 +334,10 @@ private:
     bool resumeAfterPlaybackPause_ = false;
     bool playbackPauseRestorePending_ = false;
     quint64 playbackPauseRestoreToken_ = 0;
+    bool looping_ = false;
+    bool playbackEndPending_ = false;
+    quint64 playbackEndGeneration_ = 0;
+    quint64 playbackMediaGeneration_ = 0;
     double zoom_ = 1.0;
     QPoint panOffset_;
 };

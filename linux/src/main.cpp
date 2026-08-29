@@ -112,6 +112,7 @@ void testShortcuts(TestReporter &reporter) {
         {Qt::Key_Escape, {}, Command::ExitPlayback}, {Qt::Key_G, ctrl, Command::Playlist},
         {Qt::Key_P, ctrl, Command::VideoProperties}, {Qt::Key_V, ctrl, Command::VideoTools},
         {Qt::Key_R, ctrl, Command::RenameDeferred}, {Qt::Key_C, ctrl, Command::CopyDeferred},
+        {Qt::Key_L, ctrl, Command::ToggleLooping},
         {Qt::Key_Z, ctrl, Command::ZoomIn}, {Qt::Key_X, ctrl, Command::ZoomOut},
         {Qt::Key_Delete, {}, Command::RemoveDeferred}, {Qt::Key_Up, {}, Command::VolumeUp},
         {Qt::Key_Down, {}, Command::VolumeDown}, {Qt::Key_Left, {}, Command::SeekBack10},
@@ -133,7 +134,7 @@ void testShortcuts(TestReporter &reporter) {
                    QStringLiteral("%1 routed commands").arg(std::size(playback)));
     reporter.check(QStringLiteral("advertised-shortcut-matrices"),
                    MediaExplorerWindow::browserShortcutMatrix().size() == 18 &&
-                       MediaExplorerWindow::playbackShortcutMatrix().size() == 17);
+                       MediaExplorerWindow::playbackShortcutMatrix().size() == 18);
 }
 
 int runSelfTest(QApplication &application, const AppConfig &config, bool shortcutsOnly) {
